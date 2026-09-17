@@ -7,6 +7,7 @@ entire canonical FP8 Q/KV cache on every call. See README.md for interpretation.
 
 import argparse
 import bisect
+import gc
 import json
 import os
 import statistics
@@ -22,7 +23,7 @@ import torch
 
 SGLANG_FLASHINFER_WORKSPACE_SIZE = 384 * 1024 * 1024
 HEADS, D_QK, D_V, TOPK, PAGE_SIZE = 64, 576, 512, 2048, 64
-LOCAL_TOKENS, CHUNK_TOKENS, CP_SIZE = 4096, 32768, 8
+DEFAULT_CHUNK_SIZE, CP_SIZE = 32768, 8
 # The absorbed QK width is 576, but the model's pre-absorption QK width is 256.
 SOFTMAX_SCALE = (192 + 64) ** -0.5
 BACKENDS = ("trtllm", "flashmla-prefill", "flashmla-decode")
@@ -44,7 +45,31 @@ def parse_args(argv=None):
     parser.add_argument(
         "--scope", choices=("native", "adapted", "both"), default="both"
     )
-    parser.add_argument("--chunk", type=int, choices=range(4), default=3)
+    position = parser.add_mutually_exclusive_group()
+    position.add_argument("--chunk", type=int, help="Zero-based chunk index; default: 3")
+    position.add_argument("--chunks", type=int, nargs="+", help="Matrix: chunk indices")
+    position.add_argument(
+        "--total-tokens", type=int,
+        help="Fix request length and test its last chunk: chunk = total-tokens / chunk-size - 1",
+    )
+    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
+    parser.add_argument(
+        "--local-tokens",
+        type=int,
+        help="Query rows on this rank; default: chunk-size / 8",
+    )
+    parser.add_argument(
+        "--chunk-sizes", type=int, nargs="+", help="Matrix: global chunk sizes"
+    )
+    parser.add_argument(
+        "--local-tokens-list",
+        type=int,
+        nargs="+",
+        help="Matrix: rank-local query counts",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print workload plan without using CUDA"
+    )
     parser.add_argument("--rank", type=int, choices=range(8), default=0)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--warmup-iters", type=int, default=20)
@@ -67,21 +92,85 @@ def parse_args(argv=None):
         "--with-stack", action="store_true", help="Profile: Python stacks"
     )
     args = parser.parse_args(argv)
+    if args.chunk is None:
+        args.chunk = 3
     for name in ("warmup_iters", "repeat_iters", "profile_iters"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
-    if args.seed < 0 or not 0 <= args.check_rows <= LOCAL_TOKENS:
-        parser.error("seed must be nonnegative; check-rows must be in [0, 4096]")
+    if args.seed < 0 or args.check_rows < 0:
+        parser.error("seed and check-rows must be nonnegative")
+    if any(c < 0 for c in [args.chunk, *(args.chunks or [])]):
+        parser.error("chunk indices must be nonnegative")
+    if any(
+        s <= 0 or s % PAGE_SIZE for s in [args.chunk_size, *(args.chunk_sizes or [])]
+    ):
+        parser.error(f"chunk sizes must be positive multiples of {PAGE_SIZE}")
+    if args.total_tokens is not None:
+        if not 0 < args.total_tokens <= np.iinfo(np.int32).max:
+            parser.error("total-tokens must be positive and fit int32")
+        for size in args.chunk_sizes or [args.chunk_size]:
+            if args.total_tokens % size:
+                parser.error("total-tokens must be divisible by every chunk size")
+    local_counts = [*(args.local_tokens_list or [])]
+    if args.local_tokens is not None:
+        local_counts.append(args.local_tokens)
+    if any(n <= 0 for n in local_counts):
+        parser.error("local token counts must be positive")
     if not all(np.isfinite(v) and v >= 0 for v in (args.check_atol, args.check_rtol)):
         parser.error("check tolerances must be finite and nonnegative")
     args.backends = list(dict.fromkeys(args.backends))
+    args.matrix = any((args.chunks, args.chunk_sizes, args.local_tokens_list))
+    if args.matrix and args.mode != "bench":
+        parser.error(
+            "matrix runs support --mode bench; profile one configuration at a time"
+        )
+    workloads, skipped = plan_workloads(args)
+    if not workloads:
+        parser.error("no valid workloads: " + skipped[0]["reason"])
+    if skipped and not args.matrix:
+        parser.error(skipped[0]["reason"])
     return args
 
 
-def make_sparse_indices(chunk, rank, seed, batch=LOCAL_TOKENS, topk=TOPK):
+def workload_error(chunk, chunk_size, local_tokens):
+    if local_tokens > chunk_size // CP_SIZE:
+        return f"local_tokens={local_tokens} exceeds chunk_size / CP8={chunk_size // CP_SIZE}"
+    if (chunk + 1) * chunk_size > np.iinfo(np.int32).max:
+        return "context length exceeds the int32 index range"
+    return None
+
+
+def plan_workloads(args):
+    """Pair size/index for a fixed request, or use explicitly selected indices."""
+    workloads, skipped = [], []
+    chunks = list(dict.fromkeys(args.chunks or [args.chunk]))
+    sizes = list(dict.fromkeys(args.chunk_sizes or [args.chunk_size]))
+    positions = (
+        [(args.total_tokens // size - 1, size) for size in sizes]
+        if args.total_tokens is not None
+        else [(chunk, size) for chunk in chunks for size in sizes]
+    )
+    for chunk, size in positions:
+            counts = args.local_tokens_list or [
+                args.local_tokens if args.local_tokens is not None else size // CP_SIZE
+            ]
+            for count in dict.fromkeys(counts):
+                coordinates = dict(chunk=chunk, chunk_size=size, local_tokens=count)
+                error = workload_error(chunk, size, count)
+                if error:
+                    skipped.append(dict(**coordinates, reason=error))
+                    continue
+                workloads.append(argparse.Namespace(**(vars(args) | coordinates)))
+    return workloads, skipped
+
+
+def make_sparse_indices(
+    chunk, rank, seed, batch=None, topk=TOPK, chunk_size=DEFAULT_CHUNK_SIZE
+):
     """Physical token slots in one shared, contiguous KV cache; CP interleaves Q."""
+    batch = chunk_size // CP_SIZE if batch is None else batch
     causal_lens = (
-        chunk * CHUNK_TOKENS + rank + np.arange(batch, dtype=np.int64) * CP_SIZE + 1
+        chunk * chunk_size + rank + np.arange(batch, dtype=np.int64) * CP_SIZE + 1
     )
     valid_lens = np.minimum(causal_lens, topk).astype(np.int32)
     rng = np.random.default_rng(seed)
@@ -92,10 +181,15 @@ def make_sparse_indices(chunk, rank, seed, batch=LOCAL_TOKENS, topk=TOPK):
     return slots, valid_lens
 
 
-def make_inputs(chunk, rank=0, seed=1234):
+def make_inputs(
+    chunk, rank=0, seed=1234, chunk_size=DEFAULT_CHUNK_SIZE, local_tokens=None
+):
     device = torch.device("cuda:0")
-    context_len = (chunk + 1) * CHUNK_TOKENS
-    slots, valid_lens = make_sparse_indices(chunk, rank, seed)
+    local_tokens = chunk_size // CP_SIZE if local_tokens is None else local_tokens
+    context_len = (chunk + 1) * chunk_size
+    slots, valid_lens = make_sparse_indices(
+        chunk, rank, seed, batch=local_tokens, chunk_size=chunk_size
+    )
     generator = torch.Generator(device=device).manual_seed(seed)
 
     def random_fp8(shape):
@@ -104,7 +198,7 @@ def make_inputs(chunk, rank=0, seed=1234):
         ).to(torch.float8_e4m3fn)
 
     return dict(
-        query=random_fp8((LOCAL_TOKENS, 1, HEADS, D_QK)),
+        query=random_fp8((local_tokens, 1, HEADS, D_QK)),
         kv_cache=random_fp8((context_len // PAGE_SIZE, 1, PAGE_SIZE, D_QK)),
         block_tables=torch.from_numpy(slots).to(device).unsqueeze(1),
         seq_lens=torch.from_numpy(valid_lens).to(device),
@@ -165,7 +259,7 @@ def make_trtllm_case(inputs):
     return Case(
         "trtllm/native",
         lambda: trtllm_batch_decode_with_kv_cache_mla(**kwargs),
-        "Q FP8 [4096,1,64,576]; KV FP8 [pages,1,64,576]; preallocated output",
+        f"Q FP8 [{q.shape[0]},1,64,576]; KV FP8 [pages,1,64,576]; preallocated output",
     )
 
 
@@ -225,9 +319,9 @@ def make_flashmla_case(inputs, backend, scope):
         )[0]
 
     layout = (
-        "Q BF16 [4096,64,576]; KV BF16 [context,1,576]"
+        f"Q BF16 [{q_fp8.shape[0]},64,576]; KV BF16 [context,1,576]"
         if is_prefill
-        else "Q BF16 [4096,1,64,576]; KV uint8 [pages,64,1,656] (V3.2 packed FP8)"
+        else f"Q BF16 [{q_fp8.shape[0]},1,64,576]; KV uint8 [pages,64,1,656] (V3.2 packed FP8)"
     )
     return Case(f"{backend}/{scope}", run, layout)
 
@@ -260,15 +354,22 @@ def reference_rows(inputs, rows):
     return torch.stack(results)
 
 
+def select_check_rows(args, batch):
+    count = min(args.check_rows, batch)
+    # First row with a full Top-K; it can be outside this chunk or local prefix.
+    remaining = TOPK - (args.chunk * args.chunk_size + args.rank + 1)
+    transition = -(-remaining // CP_SIZE)
+    candidates = [0, batch - 1, transition - 1, transition]
+    candidates += np.linspace(0, batch - 1, count, dtype=int).tolist()
+    return list(dict.fromkeys(r for r in candidates if 0 <= r < batch))[:count]
+
+
 def check_cases(cases, inputs, args):
     if args.check_rows == 0:
         print("[CHECK] SKIPPED by --check-rows 0")
         return {"status": "skipped"}
-    # Include endpoints and the chunk-0 transition from partial to full Top-K.
-    transition = int(np.ceil((TOPK - args.rank - 1) / CP_SIZE))
-    candidates = [0, LOCAL_TOKENS - 1, transition - 1, transition]
-    candidates += np.linspace(0, LOCAL_TOKENS - 1, args.check_rows, dtype=int).tolist()
-    rows = list(dict.fromkeys(candidates))[: args.check_rows]
+    batch = inputs["query"].shape[0]
+    rows = select_check_rows(args, batch)
     allow_tf32 = torch.backends.cuda.matmul.allow_tf32
     try:
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -278,10 +379,10 @@ def check_cases(cases, inputs, args):
     checks = {}
     for case in cases:
         output = case.run()
-        expected = (LOCAL_TOKENS, HEADS, D_V)
+        expected = (batch, HEADS, D_V)
         if output.dtype != torch.bfloat16 or tuple(output.shape) not in (
             expected,
-            (LOCAL_TOKENS, 1, HEADS, D_V),
+            (batch, 1, HEADS, D_V),
         ):
             raise AssertionError(
                 f"{case.name}: unexpected output {output.shape}/{output.dtype}"
@@ -300,7 +401,11 @@ def check_cases(cases, inputs, args):
             rtol=args.check_rtol,
         )
         torch.testing.assert_close(
-            actual, reference, atol=args.check_atol, rtol=args.check_rtol
+            actual,
+            reference,
+            atol=args.check_atol,
+            rtol=args.check_rtol,
+            msg=lambda message: f"{case.name}: {message}",
         )
         print(f"[CHECK] {case.name}: PASS {json.dumps(checks[case.name])}")
     return checks
@@ -381,6 +486,9 @@ def bench(cases, args):
                     timing=args.timing,
                     mean_us=statistics.mean(samples),
                     median_us=statistics.median(samples),
+                    queries_per_second=args.local_tokens
+                    * 1e6
+                    / statistics.median(samples),
                     p05_us=float(np.percentile(samples, 5)),
                     p95_us=float(np.percentile(samples, 95)),
                     samples_us=samples,
@@ -514,7 +622,15 @@ def configuration(inputs, cases, args):
         versions=versions,
         args={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         workload=dict(
-            local_tokens=LOCAL_TOKENS,
+            total_tokens=args.total_tokens,
+            chunk=args.chunk,
+            chunk_size=args.chunk_size,
+            local_tokens=inputs["query"].shape[0],
+            query_selection=(
+                "full-rank-chunk"
+                if args.local_tokens == args.chunk_size // CP_SIZE
+                else "rank-chunk-prefix"
+            ),
             cp=CP_SIZE,
             context_len=inputs["max_seq_len"],
             heads=HEADS,
@@ -538,13 +654,14 @@ def configuration(inputs, cases, args):
     return config
 
 
-def main(argv=None):
-    args = parse_args(argv)
-    if not torch.cuda.is_available():
-        raise RuntimeError("This experiment needs an SM100/SM103 CUDA GPU")
-    if torch.cuda.get_device_capability(0) not in ((10, 0), (10, 3)):
-        raise RuntimeError("This experiment targets SM100/SM103")
-    inputs = make_inputs(chunk=args.chunk, rank=args.rank, seed=args.seed)
+def run_workload(args):
+    inputs = make_inputs(
+        chunk=args.chunk,
+        rank=args.rank,
+        seed=args.seed,
+        chunk_size=args.chunk_size,
+        local_tokens=args.local_tokens,
+    )
     cases = make_cases(inputs, args)
     result = {"configuration": configuration(inputs, cases, args)}
     with torch.inference_mode():
@@ -553,11 +670,102 @@ def main(argv=None):
             result["benchmarks"] = bench(cases, args)
         else:
             result["profile"] = profile_mla(cases, args)
+    return result
+
+
+def write_result(result, path):
+    if path is None:
+        return
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(result, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def workload_coordinates(args):
+    return dict(
+        chunk=args.chunk,
+        chunk_size=args.chunk_size,
+        local_tokens=args.local_tokens,
+        context_len=(args.chunk + 1) * args.chunk_size,
+    )
+
+
+def print_matrix_summary(rows):
+    print(
+        f"\n[MATRIX SUMMARY]\n{'chunk':>5} {'chunk_size':>10} {'local':>6} "
+        f"{'KV len':>8} {'case':30} {'cache':5} {'median/us':>11} "
+        f"{'queries/s':>11} {'TRT/this':>10}"
+    )
+    for row in rows:
+        ratio = row["speedup_vs_trtllm"]
+        ratio_text = f"{ratio:.3f}x" if ratio is not None else "n/a"
+        print(
+            f"{row['chunk']:5} {row['chunk_size']:10} {row['local_tokens']:6} "
+            f"{row['context_len']:8} {row['case']:30} {row['cache']:5} "
+            f"{row['median_us']:11.2f} {row['queries_per_second']:11.0f} {ratio_text:>10}"
+        )
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    workloads, skipped = plan_workloads(args)
+    if args.dry_run:
+        plan = dict(
+            status="planned",
+            workloads=[workload_coordinates(w) for w in workloads],
+            skipped=skipped,
+        )
+        print(json.dumps(plan, indent=2))
+        write_result(plan, args.output_json)
+        return
+    if not torch.cuda.is_available():
+        raise RuntimeError("This experiment needs an SM100/SM103 CUDA GPU")
+    if torch.cuda.get_device_capability(0) not in ((10, 0), (10, 3)):
+        raise RuntimeError("This experiment targets SM100/SM103")
+    if not args.matrix:
+        result = run_workload(workloads[0])
+    else:
+        print(f"[MATRIX] {len(workloads)} valid workloads, {len(skipped)} skipped")
+        for item in skipped:
+            print(f"[SKIP] {json.dumps(item)}")
+        result = dict(status="running", skipped=skipped, runs=[], summary=[])
+        for index, workload in enumerate(workloads, 1):
+            coordinates = workload_coordinates(workload)
+            print(
+                f"[MATRIX] {index}/{len(workloads)} {json.dumps(coordinates)}",
+                flush=True,
+            )
+            try:
+                run = run_workload(workload)
+            except Exception as error:
+                # Stop on a failed correctness check or CUDA error. Earlier runs
+                # remain available; a poisoned CUDA context must not be reused.
+                result.update(
+                    status="failed",
+                    failed_workload=dict(
+                        **coordinates, error=f"{type(error).__name__}: {error}"
+                    ),
+                )
+                write_result(result, args.output_json)
+                print_matrix_summary(result["summary"])
+                raise
+            result["runs"].append(run)
+            result["summary"].extend(
+                coordinates | {k: v for k, v in row.items() if k != "samples_us"}
+                for row in run["benchmarks"]
+            )
+            write_result(result, args.output_json)
+            # Results contain only CPU scalars/JSON. Release each workload's Q,
+            # KV, adapters and graph allocations before moving to the next size.
+            gc.collect()
+            torch.cuda.empty_cache()
+        result["status"] = "complete"
+        print_matrix_summary(result["summary"])
+    write_result(result, args.output_json)
     if args.output_json:
-        output_path = args.output_json.expanduser().resolve()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(result, indent=2) + "\n")
-        print(f"[RESULT] {output_path}")
+        print(f"[RESULT] {args.output_json.expanduser().resolve()}")
 
 
 if __name__ == "__main__":

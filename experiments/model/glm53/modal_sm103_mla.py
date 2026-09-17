@@ -65,7 +65,7 @@ image = (
 
 
 @app.function(image=image, gpu="B300", cpu=4, memory=8192, timeout=1800)
-def run(script_args: list[str], capture_json: bool = False) -> bytes | None:
+def run(script_args: list[str], capture_json: bool = False) -> tuple[int, bytes | None]:
     import subprocess
     import sys
     from importlib.metadata import version
@@ -94,8 +94,12 @@ def run(script_args: list[str], capture_json: bool = False) -> bytes | None:
             command.extend(["--output-json", str(remote_json)])
         # The benchmark's default profile trace is created here, used for its
         # kernel summary, and cleaned up without being transferred to the client.
-        subprocess.run(command, check=True, cwd=output_dir)
-        return remote_json.read_bytes() if capture_json else None
+        completed = subprocess.run(command, check=False, cwd=output_dir)
+        # A failed matrix may still have checkpoints from earlier workloads.
+        report = (
+            remote_json.read_bytes() if capture_json and remote_json.exists() else None
+        )
+        return completed.returncode, report
 
 
 @app.local_entrypoint()
@@ -109,14 +113,16 @@ def main(*script_args):
     parser.add_argument("--output-json", type=Path)
     options, remaining = parser.parse_known_args(script_args)
 
-    report = run.remote(
+    returncode, report = run.remote(
         remaining,
         capture_json=options.output_json is not None,
     )
-    if options.output_json:
-        if report is None:
-            raise RuntimeError("The remote run returned no result JSON")
+    if options.output_json and report is not None:
         path = options.output_json.expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(report)
         print(f"[RESULT] Report downloaded to local file: {path}")
+    if returncode:
+        raise SystemExit(returncode)
+    if options.output_json and report is None:
+        raise RuntimeError("The remote run returned no result JSON")
