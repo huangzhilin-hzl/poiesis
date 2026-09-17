@@ -1,333 +1,564 @@
-"""Benchmark sparse MLA without profiling, or inspect its GPU trace separately.
+"""Compare TRTLLM and DeepSeek FlashMLA on rank-local CP8 sparse prefill.
 
-Default inputs model rank-local CP8 prefill after KV gathering. They are
-synthetic inputs, not a replay of the model's actual Top-K selections.
+Synthetic inputs reproduce the baseline geometry, not actual model Top-K values.
+Native timing excludes input adaptation; adapted timing includes converting the
+entire canonical FP8 Q/KV cache on every call. See README.md for interpretation.
 """
 
 import argparse
+import bisect
 import json
+import os
 import statistics
 import time
 from collections import defaultdict
+from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Callable
 
-import flashinfer
 import numpy as np
 import torch
-from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla as mla
-from flashinfer.testing import bench_gpu_time
-from flashinfer.utils import (
-    get_device_sm_count,
-    get_trtllm_gen_multi_ctas_kv_counter_bytes,
-)
 
-# ref python/sglang/srt/layers/attention/dsa_backend.py
 SGLANG_FLASHINFER_WORKSPACE_SIZE = 384 * 1024 * 1024
-
-# ref config
-num_attention_heads = 64
-kv_lora_rank = 512
-qk_nope_head_dim = 192
-qk_rope_head_dim = 64
-index_topk = 2048
-
-TRACE_KERNEL_NAME = (
-    "fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512"
-    "PagedKvDenseStaticTokenSparseP1VarSeqQ64Kv128PersistentKeepsAbForGen"
-)
+HEADS, D_QK, D_V, TOPK, PAGE_SIZE = 64, 576, 512, 2048, 64
+LOCAL_TOKENS, CHUNK_TOKENS, CP_SIZE = 4096, 32768, 8
+# The absorbed QK width is 576, but the model's pre-absorption QK width is 256.
+SOFTMAX_SCALE = (192 + 64) ** -0.5
+BACKENDS = ("trtllm", "flashmla-prefill", "flashmla-decode")
 
 
-def parse_args():
+@dataclass
+class Case:
+    name: str
+    run: Callable[[], torch.Tensor]
+    layout: str
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("bench", "profile"), default="bench")
+    parser.add_argument(
+        "--backends", nargs="+", choices=BACKENDS, default=list(BACKENDS)
+    )
+    parser.add_argument(
+        "--scope", choices=("native", "adapted", "both"), default="both"
+    )
     parser.add_argument("--chunk", type=int, choices=range(4), default=3)
     parser.add_argument("--rank", type=int, choices=range(8), default=0)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--warmup-iters", type=int, default=20)
-    parser.add_argument(
-        "--repeat-iters", type=int, default=100, help="Bench iterations"
-    )
+    parser.add_argument("--repeat-iters", type=int, default=100)
     parser.add_argument("--profile-iters", type=int, default=20)
     parser.add_argument(
-        "--timing",
-        choices=("cuda-event", "cuda-graph"),
-        default="cuda-event",
-        help="Bench only: eager CUDA Events, or Events around CUDA Graph replay",
+        "--timing", choices=("cuda-event", "cuda-graph"), default="cuda-event"
+    )
+    parser.add_argument("--cache", choices=("warm", "cold", "both"), default="both")
+    parser.add_argument(
+        "--check-rows", type=int, default=8, help="FP32 reference rows; 0 skips"
+    )
+    parser.add_argument("--check-atol", type=float, default=0.01)
+    parser.add_argument("--check-rtol", type=float, default=0.05)
+    parser.add_argument("--trace-path", type=Path, help="Profile: Chrome trace output")
+    parser.add_argument(
+        "--output-json", type=Path, help="Configuration, checks and timings"
     )
     parser.add_argument(
-        "--cache", choices=("warm", "cold", "both"), default="both", help="Bench only"
+        "--with-stack", action="store_true", help="Profile: Python stacks"
     )
-    parser.add_argument(
-        "--trace-path", type=Path, help="Profile only: output Chrome trace JSON path"
-    )
-    parser.add_argument(
-        "--with-stack", action="store_true", help="Profile only: collect Python stacks"
-    )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     for name in ("warmup_iters", "repeat_iters", "profile_iters"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
-    if args.seed < 0:
-        parser.error("--seed must be non-negative")
+    if args.seed < 0 or not 0 <= args.check_rows <= LOCAL_TOKENS:
+        parser.error("seed must be nonnegative; check-rows must be in [0, 4096]")
+    if not all(np.isfinite(v) and v >= 0 for v in (args.check_atol, args.check_rtol)):
+        parser.error("check tolerances must be finite and nonnegative")
+    args.backends = list(dict.fromkeys(args.backends))
     return args
 
 
-def warmup(kwargs, iters):
-    for _ in range(iters):
-        mla(**kwargs)
-    torch.cuda.synchronize()
-
-
-def print_config(kwargs, args):
-    device = kwargs["query"].device
-    print(
-        f"GPU: {torch.cuda.get_device_name(device)}, "
-        f"compute capability: {torch.cuda.get_device_capability(device)}"
+def make_sparse_indices(chunk, rank, seed, batch=LOCAL_TOKENS, topk=TOPK):
+    """Physical token slots in one shared, contiguous KV cache; CP interleaves Q."""
+    causal_lens = (
+        chunk * CHUNK_TOKENS + rank + np.arange(batch, dtype=np.int64) * CP_SIZE + 1
     )
-    print(f"PyTorch: {torch.__version__}, CUDA runtime: {torch.version.cuda}")
-    print(f"FlashInfer: {flashinfer.__version__}")
-    print(f"mode={args.mode}, chunk={args.chunk}, rank={args.rank}, seed={args.seed}")
-    for name in ("query", "kv_cache", "block_tables", "seq_lens", "out"):
-        tensor = kwargs[name]
-        print(
-            f"{name}: shape={tuple(tensor.shape)}, "
-            f"dtype={tensor.dtype}, stride={tensor.stride()}"
-        )
-    print(
-        f"backend={kwargs['backend']}, enable_dcp={kwargs['enable_dcp']}, "
-        f"enable_pdl={kwargs['enable_pdl']}, max_seq_len={kwargs['max_seq_len']}, "
-        f"topk={kwargs['sparse_mla_top_k']}, bmm1_scale={kwargs['bmm1_scale']}"
-    )
-
-
-def bench(kwargs, args):
-    print(f"[BENCH] profiler=off, timing={args.timing}")
-    print("Measures GPU elapsed time for the API call, not an individual kernel.")
-    if args.timing == "cuda-event":
-        print("Eager timing can include host launch gaps between CUDA Events.")
-    else:
-        print(
-            "CUDA Graph replay reduces host launch overhead; "
-            "the prefill trace is eager."
-        )
-    cache_modes = {"warm": (False,), "cold": (True,), "both": (False, True)}
-    for cold in cache_modes[args.cache]:
-        times_ms = bench_gpu_time(
-            mla,
-            input_kwargs=kwargs,
-            enable_cupti=False,
-            use_cuda_graph=args.timing == "cuda-graph",
-            cold_l2_cache=cold,
-            dry_run_iters=args.warmup_iters,
-            repeat_iters=args.repeat_iters,
-        )
-        print(
-            f"[BENCH] cold_l2={cold}, samples={len(times_ms)}: "
-            f"mean={statistics.mean(times_ms) * 1000:.2f} us, "
-            f"median={statistics.median(times_ms) * 1000:.2f} us"
-        )
-
-
-def profile_mla(kwargs, args):
-    # Import and enable the profiler only in the separate profile mode.
-    from torch.profiler import ProfilerActivity, profile, record_function
-
-    print("[PROFILE] Diagnostic timings only: profiling can perturb kernel execution.")
-    print("Eager calls, no L2 flush; --timing and --cache apply only to bench.")
-    trace_path = args.trace_path or Path(
-        f"sm103_mla_chunk{args.chunk}_rank{args.rank}_{time.time_ns()}.json"
-    )
-    trace_path = trace_path.expanduser().resolve()
-    trace_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=False,
-        with_stack=args.with_stack,
-        profile_memory=False,
-    ) as prof:
-        for i in range(args.profile_iters):
-            with record_function(f"mla_probe_{i}"):
-                mla(**kwargs)
-            torch.cuda.synchronize()
-
-    prof.export_chrome_trace(str(trace_path))
-    print(f"[PROFILE] Trace saved to: {trace_path}")
-    events = json.loads(trace_path.read_text())["traceEvents"]
-    groups = defaultdict(list)
-    for event in events:
-        if event.get("cat") in {"kernel", "gpu_memcpy", "gpu_memset"}:
-            if "dur" in event:
-                groups[(event["cat"], event["name"])].append(event)
-    if not any(category == "kernel" for category, _ in groups):
-        raise RuntimeError(
-            "No GPU kernel events captured; check profiler/CUPTI support."
-        )
-
-    for (category, name), rows in sorted(
-        groups.items(),
-        key=lambda item: sum(event["dur"] for event in item[1]),
-        reverse=True,
-    ):
-        durations = [event["dur"] for event in rows]  # Chrome trace uses microseconds.
-        print(f"\n[PROFILE/{category}] {name}")
-        print(
-            f"count={len(rows)}, mean={statistics.mean(durations):.2f} us, "
-            f"median={statistics.median(durations):.2f} us"
-        )
-        configs = {
-            json.dumps(
-                {
-                    key: event.get("args", {}).get(key)
-                    for key in (
-                        "grid",
-                        "block",
-                        "registers per thread",
-                        "shared memory",
-                    )
-                },
-                sort_keys=True,
-            )
-            for event in rows
-        }
-        for config in sorted(configs):
-            print(config)
-
-    matched = ("kernel", TRACE_KERNEL_NAME) in groups
-    print(f"\n[PROFILE] Original prefill kernel name matched: {matched}")
-    print(
-        "Reference: grid=[1,1,4096], block=[512,1,1], "
-        "registers=128, smem=219776 bytes"
-    )
-
-
-def make_inputs(
-    chunk: int,
-    rank: int = 0,
-    workspace_bytes: int = SGLANG_FLASHINFER_WORKSPACE_SIZE,
-    seed: int = 1234,
-):
-    assert 0 <= chunk < 4
-    assert 0 <= rank < 8
-
-    device = torch.device("cuda:0")
-    batch, heads, topk, page_size = 4096, 64, 2048, 64
-    context_len = (chunk + 1) * 32768
-
-    causal_lens = chunk * 32768 + rank + np.arange(batch, dtype=np.int64) * 8 + 1
     valid_lens = np.minimum(causal_lens, topk).astype(np.int32)
-
     rng = np.random.default_rng(seed)
-    generator = torch.Generator(device=device).manual_seed(seed)
     slots = np.full((batch, topk), -1, dtype=np.int32)
     for i, causal_len in enumerate(causal_lens):
         n = int(valid_lens[i])
         slots[i, :n] = rng.choice(int(causal_len), n, replace=False)
+    return slots, valid_lens
+
+
+def make_inputs(chunk, rank=0, seed=1234):
+    device = torch.device("cuda:0")
+    context_len = (chunk + 1) * CHUNK_TOKENS
+    slots, valid_lens = make_sparse_indices(chunk, rank, seed)
+    generator = torch.Generator(device=device).manual_seed(seed)
 
     def random_fp8(shape):
         return torch.randn(
             shape, device=device, dtype=torch.bfloat16, generator=generator
         ).to(torch.float8_e4m3fn)
 
-    counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
-        batch, heads, get_device_sm_count(device)
-    )
-
     return dict(
-        query=random_fp8((batch, 1, heads, 576)),
-        kv_cache=random_fp8((context_len // page_size, 1, page_size, 576)),
-        workspace_buffer=torch.zeros(workspace_bytes, device=device, dtype=torch.uint8),
-        qk_nope_head_dim=192,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
+        query=random_fp8((LOCAL_TOKENS, 1, HEADS, D_QK)),
+        kv_cache=random_fp8((context_len // PAGE_SIZE, 1, PAGE_SIZE, D_QK)),
         block_tables=torch.from_numpy(slots).to(device).unsqueeze(1),
         seq_lens=torch.from_numpy(valid_lens).to(device),
         max_seq_len=context_len,
-        sparse_mla_top_k=topk,
-        out=torch.empty(
-            (batch, 1, heads, 512),
-            device=device,
-            dtype=torch.bfloat16,
+    )
+
+
+def pack_flashmla_kv(kv_cache):
+    """Lossless V3.2-layout adapter for unit-scale FP8 baseline KV, NOT V4.
+
+    656 bytes/token = 512 FP8 NoPE + 4 FP32 scales + 64 BF16 RoPE.
+    NoPE bytes are preserved and scales are 1; FP8 -> BF16 RoPE is exact.
+    """
+    if kv_cache.dtype != torch.float8_e4m3fn or kv_cache.shape[-1] != D_QK:
+        raise ValueError("Expected unit-scale E4M3 KV with width 576")
+    pages, kv_heads, page_size, _ = kv_cache.shape
+    if kv_heads != 1:
+        raise ValueError("This benchmark requires one shared KV head")
+    kv = kv_cache.view(pages, page_size, 1, D_QK)
+    packed = torch.empty((*kv.shape[:-1], 656), dtype=torch.uint8, device=kv.device)
+    packed[..., :512].copy_(kv[..., :512].view(torch.uint8))
+    packed[..., 512:528].view(torch.float32).fill_(1.0)
+    packed[..., 528:].copy_(kv[..., 512:].to(torch.bfloat16).view(torch.uint8))
+    return packed
+
+
+def make_trtllm_case(inputs):
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+    from flashinfer.utils import (
+        get_device_sm_count,
+        get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    )
+
+    q = inputs["query"]
+    counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        q.shape[0], HEADS, get_device_sm_count(q.device)
+    )
+    kwargs = dict(
+        **inputs,
+        workspace_buffer=torch.zeros(
+            SGLANG_FLASHINFER_WORKSPACE_SIZE, device=q.device, dtype=torch.uint8
         ),
-        bmm1_scale=(qk_nope_head_dim + qk_rope_head_dim) ** -0.5,
+        qk_nope_head_dim=192,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        sparse_mla_top_k=TOPK,
+        out=torch.empty((*q.shape[:-1], D_V), device=q.device, dtype=torch.bfloat16),
+        bmm1_scale=SOFTMAX_SCALE,
         bmm2_scale=1.0,
         backend="trtllm-gen",
         is_var_seq=True,
         enable_dcp=False,
         enable_pdl=None,
         multi_ctas_kv_counter_buffer=torch.zeros(
-            counter_bytes, device=device, dtype=torch.uint8
+            counter_bytes, device=q.device, dtype=torch.uint8
         ),
+    )
+    return Case(
+        "trtllm/native",
+        lambda: trtllm_batch_decode_with_kv_cache_mla(**kwargs),
+        "Q FP8 [4096,1,64,576]; KV FP8 [pages,1,64,576]; preallocated output",
     )
 
 
-# def test():
-#     torch.manual_seed(42)
-#     device = "cuda"
+def make_flashmla_case(inputs, backend, scope):
+    try:
+        from flash_mla import (
+            flash_mla_sparse_fwd,
+            flash_mla_with_kvcache,
+            get_mla_metadata,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "Install pinned DeepSeek FlashMLA; see README.md / Modal runner"
+        ) from error
 
-#     ## prefill
-#     batch_size = 4096
-#     q_len_per_request = 1
-#     num_pages = 65535
-#     page_size = 64
+    q_fp8, kv_fp8 = inputs["query"], inputs["kv_cache"]
+    indices, lengths = inputs["block_tables"], inputs["seq_lens"]
+    is_prefill = backend == "flashmla-prefill"
 
-#     query = torch.randn(
-#         batch_size,
-#         q_len_per_request,
-#         num_attention_heads,
-#         kv_lora_rank + qk_rope_head_dim,
-#         device=device,
-#         dtype=torch.float8_e4m3fn,
-#     )
-#     kv_cache = torch.randn(
-#         num_pages,
-#         1,
-#         page_size,
-#         kv_lora_rank + qk_rope_head_dim,
-#         device=device,
-#         dtype=torch.float8_e4m3fn,
-#     )
-#     workspace_buffer = torch.empty(
-#         SGLANG_FLASHINFER_WORKSPACE_SIZE, device=device, dtype=torch.uint8
-#     )
-#     sm_count = flashinfer.utils.get_device_sm_count(device)
-#     required_bytes = flashinfer.utils.get_trtllm_gen_multi_ctas_kv_counter_bytes(
-#         batch_size, num_attention_heads, sm_count
-#     )
-#     multi_ctas_kv_counter_buffer = torch.zeros(
-#         required_bytes, device=device, dtype=torch.uint8
-#     )
-#     block_tables = torch.zeros(
-#         (batch_size, 1, index_topk), sdevice=device, dtype=torch.int8
-#     )
-#     seq_lens = [batch_size]
-#     max_seq_len=32768
-#     bmm1_scale = 1.0 * 1.0 * (qk_nope_head_dim + qk_rope_head_dim) ** -0.5
+    def prepare():
+        q = q_fp8.to(torch.bfloat16)
+        if is_prefill:
+            return q.squeeze(1), kv_fp8.view(-1, 1, D_QK).to(torch.bfloat16)
+        return q, pack_flashmla_kv(kv_fp8)
 
-#     flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-#         query=query,
-#         kv_cache=kv_cache,
-#         workspace_buffer=workspace_buffer,
-#         qk_nope_head_dim=qk_nope_head_dim,
-#         kv_lora_rank=kv_lora_rank,
-#         qk_rope_head_dim=qk_rope_head_dim,
-#         block_tables=block_tables,
-#         seq_lens=seq_lens,
-#         max_seq_len=,
-#         sparse_mla_top_k=index_topk,
-#         bmm1_scale=bmm1_scale,
-#         backend="trtllm-gen",
-#         skip_softmax_threshold_scale_factor=False,
-#         multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
-#     )
+    prepared = prepare() if scope == "native" else None
+    # Metadata is initialized during correctness/warmup, before graph capture.
+    # Reuse is valid: shapes and topk_length values do not change between calls.
+    metadata, num_splits = get_mla_metadata() if not is_prefill else (None, None)
+
+    def run():
+        q, kv = prepared if prepared is not None else prepare()
+        if is_prefill:
+            return flash_mla_sparse_fwd(
+                q=q,
+                kv=kv,
+                indices=indices,
+                sm_scale=SOFTMAX_SCALE,
+                d_v=D_V,
+                attn_sink=None,
+                topk_length=lengths,
+            )[0]
+        return flash_mla_with_kvcache(
+            q=q,
+            k_cache=kv,
+            block_table=None,
+            cache_seqlens=None,
+            head_dim_v=D_V,
+            tile_scheduler_metadata=metadata,
+            num_splits=num_splits,
+            softmax_scale=SOFTMAX_SCALE,
+            causal=False,  # Causality is already encoded in indices and lengths.
+            is_fp8_kvcache=True,
+            indices=indices,
+            attn_sink=None,
+            topk_length=lengths,
+        )[0]
+
+    layout = (
+        "Q BF16 [4096,64,576]; KV BF16 [context,1,576]"
+        if is_prefill
+        else "Q BF16 [4096,1,64,576]; KV uint8 [pages,64,1,656] (V3.2 packed FP8)"
+    )
+    return Case(f"{backend}/{scope}", run, layout)
+
+
+def make_cases(inputs, args):
+    scopes = ("native", "adapted") if args.scope == "both" else (args.scope,)
+    cases = []
+    for backend in args.backends:
+        if backend == "trtllm":
+            cases.append(make_trtllm_case(inputs))
+        else:
+            cases.extend(make_flashmla_case(inputs, backend, scope) for scope in scopes)
+    return cases
+
+
+def reference_rows(inputs, rows):
+    """Independent FP32 sparse softmax(QK * scale)V on selected query rows."""
+    kv = inputs["kv_cache"].view(-1, D_QK).float()
+    results = []
+    for row in rows:
+        n = int(inputs["seq_lens"][row].item())
+        slots = inputs["block_tables"][row, 0, :n].long()
+        slots = slots[(slots >= 0) & (slots < kv.shape[0])]
+        if slots.numel() == 0:
+            raise ValueError("Reference requires at least one valid key per row")
+        selected_kv = kv[slots]
+        q = inputs["query"][row, 0].float()
+        probabilities = torch.softmax((q @ selected_kv.T) * SOFTMAX_SCALE, dim=-1)
+        results.append(probabilities @ selected_kv[:, :D_V])
+    return torch.stack(results)
+
+
+def check_cases(cases, inputs, args):
+    if args.check_rows == 0:
+        print("[CHECK] SKIPPED by --check-rows 0")
+        return {"status": "skipped"}
+    # Include endpoints and the chunk-0 transition from partial to full Top-K.
+    transition = int(np.ceil((TOPK - args.rank - 1) / CP_SIZE))
+    candidates = [0, LOCAL_TOKENS - 1, transition - 1, transition]
+    candidates += np.linspace(0, LOCAL_TOKENS - 1, args.check_rows, dtype=int).tolist()
+    rows = list(dict.fromkeys(candidates))[: args.check_rows]
+    allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        reference = reference_rows(inputs, rows)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    checks = {}
+    for case in cases:
+        output = case.run()
+        expected = (LOCAL_TOKENS, HEADS, D_V)
+        if output.dtype != torch.bfloat16 or tuple(output.shape) not in (
+            expected,
+            (LOCAL_TOKENS, 1, HEADS, D_V),
+        ):
+            raise AssertionError(
+                f"{case.name}: unexpected output {output.shape}/{output.dtype}"
+            )
+        if not torch.isfinite(output).all().item():
+            raise AssertionError(f"{case.name}: output contains nonfinite values")
+        actual = output.reshape(expected)[rows].float()
+        error = actual - reference
+        rmse = error.square().mean().sqrt().item()
+        checks[case.name] = dict(
+            rows=rows,
+            max_abs=error.abs().max().item(),
+            rmse=rmse,
+            relative_rmse=rmse / max(reference.square().mean().sqrt().item(), 1e-12),
+            atol=args.check_atol,
+            rtol=args.check_rtol,
+        )
+        torch.testing.assert_close(
+            actual, reference, atol=args.check_atol, rtol=args.check_rtol
+        )
+        print(f"[CHECK] {case.name}: PASS {json.dumps(checks[case.name])}")
+    return checks
+
+
+def warmup(case, iters):
+    for _ in range(iters):
+        case.run()
+    torch.cuda.synchronize()
+
+
+def measure_case(case, args, flush_buffer):
+    warmup(case, args.warmup_iters)
+    graph, graph_output = None, None
+    if args.timing == "cuda-graph":
+        # PyTorch recommends warming up on a side stream before graph capture.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(args.warmup_iters):
+                case.run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = case.run()
+        graph.replay()
+        torch.cuda.synchronize()
+    events = [
+        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        for _ in range(args.repeat_iters)
+    ]
+    # Instantiate event handles before measuring; their first record can cost CPU time.
+    for start, end in events:
+        start.record()
+        end.record()
+    torch.cuda.synchronize()
+    for start, end in events:
+        if flush_buffer is not None:
+            flush_buffer.zero_()  # Same stream, before start; excluded from measurement.
+        start.record()
+        if graph is None:
+            output = case.run()
+        else:
+            graph.replay()
+            output = graph_output
+        end.record()
+    torch.cuda.synchronize()
+    # Keep the last output / graph allocations alive through synchronization.
+    del output
+    return [start.elapsed_time(end) * 1000 for start, end in events]
+
+
+def bench(cases, args):
+    print(f"[BENCH] profiler=off; API elapsed time; timing={args.timing}")
+    print(
+        "Eager Events include host launch gaps; Graph replay changes that execution regime."
+    )
+    print("warm=repeated input reuse; cold=best-effort L2 eviction before each call.")
+    print("native excludes adapters; adapted converts FULL Q and KV on EVERY call.")
+    print("FlashMLA APIs allocate output/auxiliary tensors; TRTLLM reuses its output.")
+    cache_modes = ("warm", "cold") if args.cache == "both" else (args.cache,)
+    properties = torch.cuda.get_device_properties(0)
+    l2_bytes = getattr(properties, "L2_cache_size", 0) or 128 * 1024 * 1024
+    flush_bytes = max(2 * l2_bytes, 256 * 1024 * 1024)
+    records = []
+    for cache in cache_modes:
+        flush = (
+            torch.empty(flush_bytes, device="cuda", dtype=torch.uint8)
+            if cache == "cold"
+            else None
+        )
+        for case in cases:
+            samples = measure_case(case, args, flush)
+            records.append(
+                dict(
+                    case=case.name,
+                    cache=cache,
+                    timing=args.timing,
+                    mean_us=statistics.mean(samples),
+                    median_us=statistics.median(samples),
+                    p05_us=float(np.percentile(samples, 5)),
+                    p95_us=float(np.percentile(samples, 95)),
+                    samples_us=samples,
+                    l2_flush_bytes=flush_bytes if cache == "cold" else 0,
+                )
+            )
+        del flush
+    baseline = {
+        r["cache"]: r["median_us"] for r in records if r["case"] == "trtllm/native"
+    }
+    print(
+        f"\n{'case':30} {'cache':5} {'median/us':>11} {'p05/us':>11} {'p95/us':>11} {'TRT/this':>10}"
+    )
+    for result in records:
+        ratio = baseline.get(result["cache"], 0) / result["median_us"]
+        result["speedup_vs_trtllm"] = ratio if result["cache"] in baseline else None
+        ratio_text = (
+            f"{ratio:.3f}x" if result["speedup_vs_trtllm"] is not None else "n/a"
+        )
+        print(
+            f"{result['case']:30} {result['cache']:5} {result['median_us']:11.2f} "
+            f"{result['p05_us']:11.2f} {result['p95_us']:11.2f} {ratio_text:>10}"
+        )
+    return records
+
+
+def profile_mla(cases, args):
+    from torch.profiler import ProfilerActivity, profile, record_function
+
+    print("[PROFILE] Diagnostic eager timings; --timing/--cache only apply to bench.")
+    trace_path = args.trace_path or Path(
+        f"sm103_mla_chunk{args.chunk}_{time.time_ns()}.json"
+    )
+    trace_path = trace_path.expanduser().resolve()
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    for case in cases:
+        warmup(case, args.warmup_iters)
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=False,
+        with_stack=args.with_stack,
+        profile_memory=False,
+    ) as prof:
+        for case in cases:
+            for i in range(args.profile_iters):
+                with record_function(f"mla_probe/{case.name}/{i}"):
+                    output = case.run()
+                    # The scope includes completion, so GPU timestamps belong to one case.
+                    torch.cuda.synchronize()
+                    del output
+    prof.export_chrome_trace(str(trace_path))
+    print(f"[PROFILE] Trace saved to: {trace_path}")
+    events = json.loads(trace_path.read_text())["traceEvents"]
+    scopes = sorted(
+        (
+            e["ts"],
+            e["ts"] + e["dur"],
+            e["name"].rsplit("/", 1)[0].removeprefix("mla_probe/"),
+        )
+        for e in events
+        if e.get("name", "").startswith("mla_probe/") and "dur" in e
+    )
+    starts = [s[0] for s in scopes]
+    groups = defaultdict(list)
+    for event in events:
+        if (
+            event.get("cat") not in {"kernel", "gpu_memcpy", "gpu_memset"}
+            or "dur" not in event
+        ):
+            continue
+        idx = bisect.bisect_right(starts, event["ts"]) - 1
+        case_name = (
+            scopes[idx][2]
+            if idx >= 0 and event["ts"] + event["dur"] <= scopes[idx][1]
+            else "unattributed"
+        )
+        groups[(case_name, event["cat"], event["name"])].append(event)
+    if not any(category == "kernel" for _, category, _ in groups):
+        raise RuntimeError("No GPU kernels captured; check CUPTI/profiler support")
+    totals = defaultdict(float)
+    for (case_name, category, _), rows in groups.items():
+        if category == "kernel":
+            totals[case_name] += sum(e["dur"] for e in rows)
+    report = []
+    for (case_name, category, name), rows in sorted(
+        groups.items(), key=lambda item: (item[0][0], -sum(e["dur"] for e in item[1]))
+    ):
+        durations = [e["dur"] for e in rows]
+        total = sum(durations)
+        configs = {
+            json.dumps(
+                {
+                    k: e.get("args", {}).get(k)
+                    for k in ("grid", "block", "registers per thread", "shared memory")
+                },
+                sort_keys=True,
+            )
+            for e in rows
+        }
+        row = dict(
+            case=case_name,
+            category=category,
+            kernel=name,
+            count=len(rows),
+            total_us=total,
+            mean_us=statistics.mean(durations),
+            per_call_us=total / args.profile_iters,
+            kernel_share_pct=(
+                100 * total / totals[case_name] if category == "kernel" else None
+            ),
+            launch_configs=[json.loads(c) for c in sorted(configs)],
+        )
+        report.append(row)
+        print(f"[PROFILE] {json.dumps(row)}")
+    return dict(trace_path=str(trace_path), kernels=report)
+
+
+def configuration(inputs, cases, args):
+    versions = {"torch": torch.__version__, "cuda": torch.version.cuda}
+    for package in ("flashinfer-python", "flash-mla"):
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            versions[package] = "not installed as a distribution"
+    versions["flashmla_source_revision"] = os.environ.get(
+        "FLASH_MLA_SOURCE_REVISION", "unreported"
+    )
+    config = dict(
+        gpu=torch.cuda.get_device_name(0),
+        capability=torch.cuda.get_device_capability(0),
+        versions=versions,
+        args={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+        workload=dict(
+            local_tokens=LOCAL_TOKENS,
+            cp=CP_SIZE,
+            context_len=inputs["max_seq_len"],
+            heads=HEADS,
+            qk_dim=D_QK,
+            v_dim=D_V,
+            topk=TOPK,
+            page_size=PAGE_SIZE,
+            softmax_scale=SOFTMAX_SCALE,
+            bmm2_scale=1.0,
+            synthetic=True,
+            enable_dcp=False,
+        ),
+        tensors={
+            k: dict(shape=list(v.shape), dtype=str(v.dtype), stride=list(v.stride()))
+            for k, v in inputs.items()
+            if isinstance(v, torch.Tensor)
+        },
+        cases={case.name: case.layout for case in cases},
+    )
+    print(json.dumps(config, indent=2))
+    return config
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if not torch.cuda.is_available():
+        raise RuntimeError("This experiment needs an SM100/SM103 CUDA GPU")
+    if torch.cuda.get_device_capability(0) not in ((10, 0), (10, 3)):
+        raise RuntimeError("This experiment targets SM100/SM103")
+    inputs = make_inputs(chunk=args.chunk, rank=args.rank, seed=args.seed)
+    cases = make_cases(inputs, args)
+    result = {"configuration": configuration(inputs, cases, args)}
+    with torch.inference_mode():
+        result["correctness"] = check_cases(cases, inputs, args)
+        if args.mode == "bench":
+            result["benchmarks"] = bench(cases, args)
+        else:
+            result["profile"] = profile_mla(cases, args)
+    if args.output_json:
+        output_path = args.output_json.expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(result, indent=2) + "\n")
+        print(f"[RESULT] {output_path}")
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    kwargs = make_inputs(chunk=args.chunk, rank=args.rank, seed=args.seed)
-    print_config(kwargs, args)
-    warmup(kwargs, args.warmup_iters)
-    if args.mode == "bench":
-        bench(kwargs, args)
-    else:
-        profile_mla(kwargs, args)
+    main()
