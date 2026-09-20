@@ -2,6 +2,7 @@ import argparse
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils as utils
 import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
@@ -14,7 +15,7 @@ class Sm100SimpleCopyKernel:
 
     @cute.jit
     def __call__(self, A_cute: cute.Tensor, B_cute: cute.Tensor):
-        self.dtype = A_cute.dtype
+        self.dtype = A_cute.element_type
 
         grid = cute.ceil_div((*A_cute.shape, 1), self.tiler)
         block = (32, 1, 1)
@@ -23,9 +24,9 @@ class Sm100SimpleCopyKernel:
             (self.tile_m, self.tile_n), stride=(self.tile_n, 1)
         )
 
-        @cute.Struct
+        @cute.struct
         class SharedStorage:
-            barrier_storage: cute.struct.MemRange[cute.Int64, 1]
+            barrier_storage: cute.struct.MemRange[cutlass.Int64, 1]
             smem_data: cute.struct.Align[
                 cute.struct.MemRange[self.dtype, cute.cosize(smem_layout)], 1024
             ]
@@ -47,18 +48,17 @@ class Sm100SimpleCopyKernel:
 
     @cute.kernel
     def kernel(self, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b, smem_layout):
-        bidx, bidy, _ = cute.block_idx()
+        bidx, bidy, _ = cute.arch.block_idx()
 
-        smem = cutlass.memory.SmemAllocator()
+        smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         barrier_ptr = storage.barrier_storage.data_ptr()
 
         with cute.arch.elect_one():
             cute.arch.mbarrier_init(barrier_ptr, 1)
-            cute.arch.mbarrier_arrive_and_expect_tx(
-                barrier_ptr, self.num_tma_load_bytes
-            )
+            # Set the byte count here; arrive exactly once after issuing the load.
+            cute.arch.mbarrier_expect_tx(barrier_ptr, self.num_tma_load_bytes)
 
         cute.arch.mbarrier_init_fence()
         cute.arch.barrier()
@@ -99,7 +99,7 @@ class Sm100SimpleCopyKernel:
         cute.copy(tma_atom_b, tAsA, tBgB_cta)
 
         cute.arch.cp_async_bulk_commit_group()
-        cute.arch.cp.aysnc_bulk_wait_group(0)
+        cute.arch.cp_async_bulk_wait_group(0)
 
 
 def run():
@@ -111,17 +111,20 @@ def run():
     A = torch.randn(M, N, device=device, dtype=torch.float32)
     B = torch.empty(M, N, device=device, dtype=torch.float32)
 
-    A_cute = from_dlpack(A)
-    B_cute = from_dlpack(B)
+    A_cute = from_dlpack(A, assumed_align=16)
+    B_cute = from_dlpack(B, assumed_align=16)
 
     kerenl = Sm100SimpleCopyKernel()
     compiled = cute.compile(kerenl, A_cute, B_cute)
 
     compiled(A_cute, B_cute)
+    # Report asynchronous kernel failures before starting the validation kernels.
+    torch.cuda.synchronize()
 
-    torch.testing.assert_close(A, B)
+    torch.testing.assert_close(A, B, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
 
     run()
+
