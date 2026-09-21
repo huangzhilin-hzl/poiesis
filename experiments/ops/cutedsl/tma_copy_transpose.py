@@ -34,7 +34,7 @@ class Sm100TransposeCopyKernel:
         self.dtype = A_cute.element_type
 
         grid = cute.ceil_div((*A_cute.shape, 1), self.tiler)
-        block = (32, 1, 1)
+        block = (self.threads_per_cta, 1, 1)
 
         B_trans_cute = cute.make_tensor(
             B_cute.iterator,
@@ -63,10 +63,10 @@ class Sm100TransposeCopyKernel:
             load_barrier_storage: cute.struct.MemRange[cutlass.Int64, 1]
             store_barrier_storage: cute.struct.MemRange[cutlass.Int64, 1]
             smem_data_a: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(smem_layout_a)], 1024
+                cute.struct.MemRange[self.dtype, cute.cosize(smem_layout_a)], 128
             ]
             smem_data_b: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, cute.cosize(smem_layout_b)], 1024
+                cute.struct.MemRange[self.dtype, cute.cosize(smem_layout_b)], 128
             ]
 
         self.shared_storage = SharedStorage
@@ -126,7 +126,7 @@ class Sm100TransposeCopyKernel:
         cute.arch.mbarrier_init_fence()
         cute.arch.barrier()
 
-        if warp_idx == self.load_warp_idx:
+        if warp_idx == self.tma_load_warp_id:
 
             gA_tiled = cute.local_tile(
                 tma_tensor_a, (self.tile_m, self.tile_n), (None, None)
@@ -146,7 +146,7 @@ class Sm100TransposeCopyKernel:
             with cute.elect_one():
                 cute.arch.mbarrier_arrive(load_barrier_ptr)
 
-        if warp_idx < self.load_warp_idx:
+        if warp_idx < self.tma_load_warp_id:
             trans_tid = tidx % self.num_trans_threads
             cute.arch.mbarrier_wait(load_barrier_ptr, 0)
 
@@ -167,10 +167,10 @@ class Sm100TransposeCopyKernel:
             tCsA = thr_copy.partition_S(smem_tensor_a)
 
             tCrA = cute.make_fragment_like(tCsA)
-            cute.copy(copy_atom, tCsA, tCrA)
+            cute.copy(tiled_copy, tCsA, tCrA)
 
             tCsB = thr_copy.partition_D(smem_tensor_b)
-            cute.copy(copy_atom, tCrA, tCsB)
+            cute.copy(tiled_copy, tCrA, tCsB)
 
             cute.arch.fence_proxy(
                 "async.shared",
@@ -182,7 +182,7 @@ class Sm100TransposeCopyKernel:
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive(store_barrier_ptr)
 
-        if warp_idx == self.store_warp_idx:
+        if warp_idx == self.tma_store_warp_id:
             cute.arch.mbarrier_wait(store_barrier_ptr, 0)
 
             gB_tiled = cute.local_tile(
