@@ -200,11 +200,6 @@ class Sm100TransposeCopyKernel:
             tCgB_cta = tCgB[None, bidx, bidy]
             cute.copy(tma_atom_b, tCsB, tCgB_cta)
 
-            with cute.arch.elect_one():
-
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0)
-
 
 def run():
     torch.manual_seed(442)
