@@ -141,9 +141,9 @@ class Sm100TransposeCopyKernel:
             )
 
             tAgA_cta = tAgA[None, bidx, bidy]
-            cute.copy(tma_atom_a, tAgA_cta, tAsA, tma_bar_ptr=load_barrier_ptr)
+            cute.copy(tma_atom_a, tAgA_cta, tAsA[None, 0], tma_bar_ptr=load_barrier_ptr)
 
-            with cute.elect_one():
+            with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive(load_barrier_ptr)
 
         if warp_idx < self.tma_load_warp_id:
@@ -198,7 +198,7 @@ class Sm100TransposeCopyKernel:
             )
 
             tCgB_cta = tCgB[None, bidx, bidy]
-            cute.copy(tma_atom_b, tCsB, tCgB_cta)
+            cute.copy(tma_atom_b, tCsB[None, 0], tCgB_cta)
 
 
 def run():
@@ -208,19 +208,19 @@ def run():
     M, N = 4096, 8192
 
     A = torch.randn(M, N, device=device, dtype=torch.float32)
-    B = torch.empty(M, N, device=device, dtype=torch.float32)
+    B = torch.empty(N, M, device=device, dtype=torch.float32)
 
     A_cute = from_dlpack(A, assumed_align=16)
     B_cute = from_dlpack(B, assumed_align=16)
 
-    kerenl = Sm100SimpleCopyKernel()
+    kerenl = Sm100TransposeCopyKernel()
     compiled = cute.compile(kerenl, A_cute, B_cute)
 
     compiled(A_cute, B_cute)
     # Report asynchronous kernel failures before starting the validation kernels.
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(A, B, rtol=0, atol=0)
+    torch.testing.assert_close(A.T, B, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
