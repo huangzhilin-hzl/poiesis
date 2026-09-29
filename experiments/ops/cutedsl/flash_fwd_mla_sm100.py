@@ -71,6 +71,8 @@ class FlashAttentionMLAForwardSm100:
             self.tile_n,
         )
 
+        self.num_stages_Q = 1
+
     @cute.jit
     def __call__(self, mQ, mQv, mK, mV, mO, mIndexTopk):
         """
@@ -183,7 +185,10 @@ class FlashAttentionMLAForwardSm100:
 
 
         # smem sepc
-        
+        _smem_layout_specs = [
+            ("sQ_layout", sm100_utils.make_smem_layout_a, tiled_mma_QK, self.mma_tiler_QK,  mQ.element.dtype,  self.num_stages_Q),
+            ("sQ_layout", sm100_utils.make_smem_layout_a, tiled_mma_QK, self.mma_tiler_QK,  mQ.element.dtype,  self.num_stages_Q),
+        ]
 
 
     @cute.kernel
