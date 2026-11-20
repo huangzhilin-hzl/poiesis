@@ -9,8 +9,8 @@ CUDA Graph replay (warm L2 and cold L2):
                 6 outputs (global memory latency floor).
   3. +Math    : Add ``sqrt(softplus(logit)) + bias``, NaN -> -1e30, -0.0 -> +0.0
                 canonicalization, and float32 -> order-preserving uint32 key.
-  4. FullTopK : Add top-6 ``warp_redux_sync`` selection (4-warp two-stage for
-                ``M <= 256``, 1-warp zero-SMEM for ``M > 256``) and 8-lane
+  4. FullTopK : Add top-6 ``warp_redux_sync`` selection (4-warp two-stage when
+                ``M <= 4 * sm_count``, 1-warp zero-SMEM otherwise) and 8-lane
                 butterfly renormalization.
 
 Example usage:
@@ -35,8 +35,15 @@ from cutlass.cute.runtime import make_fake_stream
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 _TOPK = 6
-_MULTI_WARP_MAX_TOKENS = 256
+_WARP_SCHEDULERS_PER_SM = 4
 _SmemAllocator = getattr(cutlass, "memory", cutlass.utils).SmemAllocator
+
+
+@cache
+def _multi_warp_max_tokens(device_index: int) -> int:
+    """Switch from 4-warp to 1-warp once 1-warp CTAs saturate SM schedulers."""
+    sm_count = torch.cuda.get_device_properties(device_index).multi_processor_count
+    return _WARP_SCHEDULERS_PER_SM * sm_count
 
 
 def _asm(
@@ -234,7 +241,7 @@ class MemOnlyKernel:
     def __init__(self, num_experts: int, num_warps: int, use_pdl: bool) -> None:
         self.num_experts = num_experts
         self.threads = num_warps * 32
-        self.per_lane = num_experts // self.threads
+        self.experts_per_thread = num_experts // self.threads
         self.use_pdl = use_pdl
 
     @cute.jit
@@ -266,12 +273,12 @@ class MemOnlyKernel:
         row, _, _ = cute.arch.block_idx()
         warp = tid // 32
         lane = tid % 32
-        per_lane = self.per_lane
-        warp_base = warp * (32 * per_lane)
+        experts_per_thread = self.experts_per_thread
+        warp_base = warp * (32 * experts_per_thread)
 
         acc = Float32(0.0)
         row_base = gating_output + Int64(row) * (self.num_experts * 4)
-        for j in cutlass.range_constexpr(per_lane):
+        for j in cutlass.range_constexpr(experts_per_thread):
             e = warp_base + j * 32 + lane
             bv = _load_f32_nc(correction_bias + Int64(e) * 4)
             lv = _load_f32_nc(row_base + Int64(e) * 4)
@@ -287,7 +294,7 @@ class MathOnlyKernel:
     def __init__(self, num_experts: int, num_warps: int, use_pdl: bool) -> None:
         self.num_experts = num_experts
         self.threads = num_warps * 32
-        self.per_lane = num_experts // self.threads
+        self.experts_per_thread = num_experts // self.threads
         self.use_pdl = use_pdl
 
     @cute.jit
@@ -319,13 +326,13 @@ class MathOnlyKernel:
         row, _, _ = cute.arch.block_idx()
         warp = tid // 32
         lane = tid % 32
-        per_lane = self.per_lane
-        warp_base = warp * (32 * per_lane)
+        experts_per_thread = self.experts_per_thread
+        warp_base = warp * (32 * experts_per_thread)
 
         acc = Float32(0.0)
         kacc = Uint32(0)
         row_base = gating_output + Int64(row) * (self.num_experts * 4)
-        for j in cutlass.range_constexpr(per_lane):
+        for j in cutlass.range_constexpr(experts_per_thread):
             e = warp_base + j * 32 + lane
             bv = _load_f32_nc(correction_bias + Int64(e) * 4)
             lv = _load_f32_nc(row_base + Int64(e) * 4)
@@ -344,8 +351,8 @@ class FullTopkKernel:
         self.num_experts = num_experts
         self.num_warps = num_warps
         self.threads = num_warps * 32
-        self.per_lane = num_experts // self.threads
-        self.candidates = num_warps * _TOPK
+        self.experts_per_thread = num_experts // self.threads
+        self.num_merge_candidates = num_warps * _TOPK
         self.use_pdl = use_pdl
 
     @cute.jit
@@ -372,9 +379,9 @@ class FullTopkKernel:
 
             @cute.struct
             class Storage:
-                cand_key: cute.struct.MemRange[Uint32, self.candidates]
-                cand_id: cute.struct.MemRange[Int32, self.candidates]
-                cand_score: cute.struct.MemRange[Float32, self.candidates]
+                merge_keys: cute.struct.MemRange[Uint32, self.num_merge_candidates]
+                merge_ids: cute.struct.MemRange[Int32, self.num_merge_candidates]
+                merge_scores: cute.struct.MemRange[Float32, self.num_merge_candidates]
 
             self.kernel_4w(
                 gating_output, correction_bias, topk_weights, topk_ids, scale, Storage
@@ -417,49 +424,51 @@ class FullTopkKernel:
     ):
         lane, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
-        per_lane = self.per_lane
+        experts_per_thread = self.experts_per_thread
 
-        b_arr = cute.make_rmem_tensor(cute.make_layout(per_lane), Float32)
-        for j in cutlass.range_constexpr(per_lane):
-            b_arr[j] = _load_f32_nc(correction_bias + Int64(j * 32 + lane) * 4)
+        expert_bias = cute.make_rmem_tensor(
+            cute.make_layout(experts_per_thread), Float32
+        )
+        for j in cutlass.range_constexpr(experts_per_thread):
+            expert_bias[j] = _load_f32_nc(correction_bias + Int64(j * 32 + lane) * 4)
 
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_wait()
 
-        score = cute.make_rmem_tensor(cute.make_layout(per_lane), Float32)
-        key = cute.make_rmem_tensor(cute.make_layout(per_lane), Uint32)
+        score = cute.make_rmem_tensor(cute.make_layout(experts_per_thread), Float32)
+        key = cute.make_rmem_tensor(cute.make_layout(experts_per_thread), Uint32)
         row_base = gating_output + Int64(row) * (self.num_experts * 4)
-        for j in cutlass.range_constexpr(per_lane):
+        for j in cutlass.range_constexpr(experts_per_thread):
             logit = _load_f32_nc(row_base + Int64(j * 32 + lane) * 4)
-            score[j], key[j] = _score_and_key(logit, b_arr[j])
+            score[j], key[j] = _score_and_key(logit, expert_bias[j])
 
         best_key = Uint32(key[0])
-        best_j = Int32(0)
-        for j in cutlass.range_constexpr(1, per_lane):
+        best_local_idx = Int32(0)
+        for j in cutlass.range_constexpr(1, experts_per_thread):
             if Uint32(key[j]) > best_key:
                 best_key = Uint32(key[j])
-                best_j = Int32(j)
+                best_local_idx = Int32(j)
 
         slot_weight = Float32(0.0)
         slot_id = Int32(0)
         for slot in cutlass.range_constexpr(_TOPK):
             top = Uint32(cute.arch.warp_redux_sync(best_key, "umax"))
-            mine = Uint32(0xFFFFFFFF)
+            tied_expert_id = Uint32(0xFFFFFFFF)
             if best_key == top:
-                mine = Uint32(lane + 32 * best_j)
-            winner = Int32(cute.arch.warp_redux_sync(mine, "umin"))
+                tied_expert_id = Uint32(lane + 32 * best_local_idx)
+            winner = Int32(cute.arch.warp_redux_sync(tied_expert_id, "umin"))
             won = Float32(0.0)
-            if winner == lane + 32 * best_j:
-                for j in cutlass.range_constexpr(per_lane):
-                    if best_j == j:
+            if winner == lane + 32 * best_local_idx:
+                for j in cutlass.range_constexpr(experts_per_thread):
+                    if best_local_idx == j:
                         won = score[j]
                         key[j] = Uint32(0)
                 best_key = Uint32(key[0])
-                best_j = Int32(0)
-                for j in cutlass.range_constexpr(1, per_lane):
+                best_local_idx = Int32(0)
+                for j in cutlass.range_constexpr(1, experts_per_thread):
                     if Uint32(key[j]) > best_key:
                         best_key = Uint32(key[j])
-                        best_j = Int32(j)
+                        best_local_idx = Int32(j)
             weight = cute.arch.shuffle_sync(won, winner & 31)
             if lane == slot:
                 slot_weight = weight
@@ -486,59 +495,67 @@ class FullTopkKernel:
         row, _, _ = cute.arch.block_idx()
         warp = tid // 32
         lane = tid % 32
-        per_lane = self.per_lane
-        warp_base = warp * (32 * per_lane)
+        experts_per_thread = self.experts_per_thread
+        warp_base = warp * (32 * experts_per_thread)
 
         smem = _SmemAllocator()
         storage = smem.allocate(Storage)
-        s_key = storage.cand_key.get_tensor(cute.make_layout(self.candidates))
-        s_id = storage.cand_id.get_tensor(cute.make_layout(self.candidates))
-        s_score = storage.cand_score.get_tensor(cute.make_layout(self.candidates))
+        smem_keys = storage.merge_keys.get_tensor(
+            cute.make_layout(self.num_merge_candidates)
+        )
+        smem_ids = storage.merge_ids.get_tensor(
+            cute.make_layout(self.num_merge_candidates)
+        )
+        smem_scores = storage.merge_scores.get_tensor(
+            cute.make_layout(self.num_merge_candidates)
+        )
 
-        b_arr = cute.make_rmem_tensor(cute.make_layout(per_lane), Float32)
-        for j in cutlass.range_constexpr(per_lane):
+        expert_bias = cute.make_rmem_tensor(
+            cute.make_layout(experts_per_thread), Float32
+        )
+        for j in cutlass.range_constexpr(experts_per_thread):
             e = warp_base + j * 32 + lane
-            b_arr[j] = _load_f32_nc(correction_bias + Int64(e) * 4)
+            expert_bias[j] = _load_f32_nc(correction_bias + Int64(e) * 4)
 
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_wait()
 
-        score = cute.make_rmem_tensor(cute.make_layout(per_lane), Float32)
-        key = cute.make_rmem_tensor(cute.make_layout(per_lane), Uint32)
+        score = cute.make_rmem_tensor(cute.make_layout(experts_per_thread), Float32)
+        key = cute.make_rmem_tensor(cute.make_layout(experts_per_thread), Uint32)
         row_base = gating_output + Int64(row) * (self.num_experts * 4)
-        for j in cutlass.range_constexpr(per_lane):
+        for j in cutlass.range_constexpr(experts_per_thread):
             e = warp_base + j * 32 + lane
             logit = _load_f32_nc(row_base + Int64(e) * 4)
-            score[j], key[j] = _score_and_key(logit, b_arr[j])
+            score[j], key[j] = _score_and_key(logit, expert_bias[j])
 
         best_key = Uint32(key[0])
-        best_j = Int32(0)
-        for j in cutlass.range_constexpr(1, per_lane):
+        best_local_idx = Int32(0)
+        for j in cutlass.range_constexpr(1, experts_per_thread):
             if Uint32(key[j]) > best_key:
                 best_key = Uint32(key[j])
-                best_j = Int32(j)
+                best_local_idx = Int32(j)
 
         out_key = Uint32(0)
         out_id = Int32(-1)
         out_score = Float32(0.0)
         for slot in cutlass.range_constexpr(_TOPK):
             top = Uint32(cute.arch.warp_redux_sync(best_key, "umax"))
-            mine = Uint32(0xFFFFFFFF)
+            tied_expert_id = Uint32(0xFFFFFFFF)
             if best_key == top:
-                mine = Uint32(warp_base + lane + 32 * best_j)
-            winner = Int32(cute.arch.warp_redux_sync(mine, "umin"))
+                tied_expert_id = Uint32(warp_base + lane + 32 * best_local_idx)
+            winner = Int32(cute.arch.warp_redux_sync(tied_expert_id, "umin"))
             won = Float32(0.0)
-            if winner - warp_base == lane + 32 * best_j:
-                for j in cutlass.range_constexpr(per_lane):
-                    if best_j == j:
+            if winner - warp_base == lane + 32 * best_local_idx:
+                for j in cutlass.range_constexpr(experts_per_thread):
+                    if best_local_idx == j:
                         won = score[j]
                         key[j] = Uint32(0)
                 best_key = Uint32(key[0])
-                best_j = Int32(0)
-                for j in cutlass.range_constexpr(1, per_lane):
+                best_local_idx = Int32(0)
+                for j in cutlass.range_constexpr(1, experts_per_thread):
                     if Uint32(key[j]) > best_key:
                         best_key = Uint32(key[j])
-                        best_j = Int32(j)
+                        best_local_idx = Int32(j)
             weight = cute.arch.shuffle_sync(won, (winner - warp_base) & 31)
             if lane == slot:
                 out_key = top
@@ -547,9 +564,9 @@ class FullTopkKernel:
 
         if lane < _TOPK:
             idx = warp * _TOPK + lane
-            s_key[idx] = out_key
-            s_id[idx] = out_id
-            s_score[idx] = out_score
+            smem_keys[idx] = out_key
+            smem_ids[idx] = out_id
+            smem_scores[idx] = out_score
 
         cute.arch.barrier()
 
@@ -557,29 +574,29 @@ class FullTopkKernel:
             cute.arch.griddepcontrol_launch_dependents()
 
         if warp == 0:
-            c_key = Uint32(0)
-            c_id = Int32(0x7FFFFFFF)
-            c_score = Float32(0.0)
-            if lane < self.candidates:
-                c_key = s_key[lane]
-                c_id = s_id[lane]
-                c_score = s_score[lane]
+            cand_key = Uint32(0)
+            cand_id = Int32(0x7FFFFFFF)
+            cand_score = Float32(0.0)
+            if lane < self.num_merge_candidates:
+                cand_key = smem_keys[lane]
+                cand_id = smem_ids[lane]
+                cand_score = smem_scores[lane]
 
             slot_weight = Float32(0.0)
             slot_id = Int32(0)
             for slot in cutlass.range_constexpr(_TOPK):
-                top = Uint32(cute.arch.warp_redux_sync(c_key, "umax"))
-                mine = Uint32(0xFFFFFFFF)
-                if c_key == top:
-                    mine = Uint32(c_id)
-                chosen = Int32(cute.arch.warp_redux_sync(mine, "umin"))
-                holders = Uint32(cute.arch.vote_ballot_sync(c_id == chosen))
+                top = Uint32(cute.arch.warp_redux_sync(cand_key, "umax"))
+                tied_expert_id = Uint32(0xFFFFFFFF)
+                if cand_key == top:
+                    tied_expert_id = Uint32(cand_id)
+                chosen = Int32(cute.arch.warp_redux_sync(tied_expert_id, "umin"))
+                holders = Uint32(cute.arch.vote_ballot_sync(cand_id == chosen))
                 first = Int32(
                     cute.arch.popc((holders & (Uint32(0) - holders)) - Uint32(1))
                 )
-                weight = cute.arch.shuffle_sync(c_score, first)
-                if c_id == chosen:
-                    c_key = Uint32(0)
+                weight = cute.arch.shuffle_sync(cand_score, first)
+                if cand_id == chosen:
+                    cand_key = Uint32(0)
                 if lane == slot:
                     slot_weight = weight
                     slot_id = chosen
@@ -653,7 +670,6 @@ def _bench_us(
     except ImportError:
         pass
 
-    # Fallback: native CUDA Graph replay with optional rotating buffers (>128 MB).
     logits, bias = input_args
     if cold_l2:
         row_bytes = (
@@ -691,7 +707,7 @@ def _bench_us(
 def verify_correctness(num_experts: int, use_pdl: bool) -> None:
     torch.manual_seed(0)
     bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
-    for num_warps, m in ((4, 33), (1, 300)):
+    for num_warps, m in ((4, 33), (1, 1024)):
         logits = torch.randn((m, num_experts), dtype=torch.float32, device="cuda")
         logits[0] = 0.0
         logits[1] = torch.linspace(19.0, 25.0, num_experts, device="cuda")
@@ -728,7 +744,7 @@ def _bench_row(
     warmup: int,
     iters: int,
 ) -> dict:
-    num_warps = 4 if m <= _MULTI_WARP_MAX_TOKENS else 1
+    num_warps = 4 if m <= _multi_warp_max_tokens(bias.device.index) else 1
     c_empty, c_mem, c_math, c_full = _compile_stages(num_experts, num_warps, use_pdl)
     logits = torch.randn((m, num_experts), dtype=torch.float32, device="cuda")
     ow = torch.empty((m, _TOPK), dtype=torch.float32, device="cuda")
@@ -823,9 +839,10 @@ def main() -> None:
     use_pdl = (not args.no_pdl) and (major >= 9)
     ms_list = [int(x) for x in args.ms.split(",") if x.strip()]
     dev_name = torch.cuda.get_device_name(0)
+    threshold = _multi_warp_max_tokens(0)
     print(
-        f"GPU: {dev_name} (sm_{major}{minor}) | "
-        f"E={args.num_experts} | use_pdl={use_pdl}"
+        f"GPU: {dev_name} (sm_{major}{minor}) | E={args.num_experts} | "
+        f"use_pdl={use_pdl} | multi_warp_max_tokens={threshold}"
     )
 
     verify_correctness(args.num_experts, use_pdl)
