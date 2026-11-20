@@ -284,8 +284,9 @@ class MemOnlyKernel:
             lv = _load_f32_nc(row_base + Int64(e) * 4)
             acc = acc + bv + lv
         if tid < _TOPK:
-            _store_f32(topk_weights + (Int64(row) * _TOPK + Int64(tid)) * 4, acc)
-            _store_s32(topk_ids + (Int64(row) * _TOPK + Int64(tid)) * 4, Int32(tid))
+            out_idx = Int64(row) * _TOPK + tid
+            _store_f32(topk_weights + out_idx * 4, acc)
+            _store_s32(topk_ids + out_idx * 4, Int32(tid))
 
 
 class MathOnlyKernel:
@@ -340,8 +341,9 @@ class MathOnlyKernel:
             acc = acc + s
             kacc = kacc ^ k
         if tid < _TOPK:
-            _store_f32(topk_weights + (Int64(row) * _TOPK + Int64(tid)) * 4, acc)
-            _store_s32(topk_ids + (Int64(row) * _TOPK + Int64(tid)) * 4, Int32(kacc))
+            out_idx = Int64(row) * _TOPK + tid
+            _store_f32(topk_weights + out_idx * 4, acc)
+            _store_s32(topk_ids + out_idx * 4, Int32(kacc))
 
 
 class FullTopkKernel:
@@ -393,6 +395,16 @@ class FullTopkKernel:
             )
 
     @cute.jit
+    def _find_best_local(self, key: cute.Tensor):
+        best_key = key[0]
+        best_local_idx = Int32(0)
+        for j in cutlass.range_constexpr(1, self.experts_per_thread):
+            if key[j] > best_key:
+                best_key = key[j]
+                best_local_idx = Int32(j)
+        return best_key, best_local_idx
+
+    @cute.jit
     def _normalize_and_store(
         self,
         slot_weight: Float32,
@@ -407,11 +419,12 @@ class FullTopkKernel:
         for shift in cutlass.range_constexpr(2, -1, -1):
             total = _add_f32(total, cute.arch.shuffle_sync_bfly(total, 1 << shift))
         if lane < _TOPK:
+            out_idx = Int64(row) * _TOPK + lane
             _store_f32(
-                topk_weights + (Int64(row) * _TOPK + Int64(lane)) * 4,
+                topk_weights + out_idx * 4,
                 _normalized_weight(scale, total, slot_weight),
             )
-            _store_s32(topk_ids + (Int64(row) * _TOPK + Int64(lane)) * 4, slot_id)
+            _store_s32(topk_ids + out_idx * 4, slot_id)
 
     @cute.kernel
     def kernel_1w(
@@ -426,33 +439,26 @@ class FullTopkKernel:
         row, _, _ = cute.arch.block_idx()
         experts_per_thread = self.experts_per_thread
 
-        expert_bias = cute.make_rmem_tensor(
-            cute.make_layout(experts_per_thread), Float32
-        )
+        expert_bias = cute.make_rmem_tensor(experts_per_thread, Float32)
         for j in cutlass.range_constexpr(experts_per_thread):
             expert_bias[j] = _load_f32_nc(correction_bias + Int64(j * 32 + lane) * 4)
 
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_wait()
 
-        score = cute.make_rmem_tensor(cute.make_layout(experts_per_thread), Float32)
-        key = cute.make_rmem_tensor(cute.make_layout(experts_per_thread), Uint32)
+        score = cute.make_rmem_tensor(experts_per_thread, Float32)
+        key = cute.make_rmem_tensor(experts_per_thread, Uint32)
         row_base = gating_output + Int64(row) * (self.num_experts * 4)
         for j in cutlass.range_constexpr(experts_per_thread):
             logit = _load_f32_nc(row_base + Int64(j * 32 + lane) * 4)
             score[j], key[j] = _score_and_key(logit, expert_bias[j])
 
-        best_key = Uint32(key[0])
-        best_local_idx = Int32(0)
-        for j in cutlass.range_constexpr(1, experts_per_thread):
-            if Uint32(key[j]) > best_key:
-                best_key = Uint32(key[j])
-                best_local_idx = Int32(j)
+        best_key, best_local_idx = self._find_best_local(key)
 
         slot_weight = Float32(0.0)
         slot_id = Int32(0)
         for slot in cutlass.range_constexpr(_TOPK):
-            top = Uint32(cute.arch.warp_redux_sync(best_key, "umax"))
+            top = cute.arch.warp_redux_sync(best_key, "umax")
             tied_expert_id = Uint32(0xFFFFFFFF)
             if best_key == top:
                 tied_expert_id = Uint32(lane + 32 * best_local_idx)
@@ -463,12 +469,7 @@ class FullTopkKernel:
                     if best_local_idx == j:
                         won = score[j]
                         key[j] = Uint32(0)
-                best_key = Uint32(key[0])
-                best_local_idx = Int32(0)
-                for j in cutlass.range_constexpr(1, experts_per_thread):
-                    if Uint32(key[j]) > best_key:
-                        best_key = Uint32(key[j])
-                        best_local_idx = Int32(j)
+                best_key, best_local_idx = self._find_best_local(key)
             weight = cute.arch.shuffle_sync(won, winner & 31)
             if lane == slot:
                 slot_weight = weight
@@ -510,9 +511,7 @@ class FullTopkKernel:
             cute.make_layout(self.num_merge_candidates)
         )
 
-        expert_bias = cute.make_rmem_tensor(
-            cute.make_layout(experts_per_thread), Float32
-        )
+        expert_bias = cute.make_rmem_tensor(experts_per_thread, Float32)
         for j in cutlass.range_constexpr(experts_per_thread):
             e = warp_base + j * 32 + lane
             expert_bias[j] = _load_f32_nc(correction_bias + Int64(e) * 4)
@@ -520,26 +519,21 @@ class FullTopkKernel:
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_wait()
 
-        score = cute.make_rmem_tensor(cute.make_layout(experts_per_thread), Float32)
-        key = cute.make_rmem_tensor(cute.make_layout(experts_per_thread), Uint32)
+        score = cute.make_rmem_tensor(experts_per_thread, Float32)
+        key = cute.make_rmem_tensor(experts_per_thread, Uint32)
         row_base = gating_output + Int64(row) * (self.num_experts * 4)
         for j in cutlass.range_constexpr(experts_per_thread):
             e = warp_base + j * 32 + lane
             logit = _load_f32_nc(row_base + Int64(e) * 4)
             score[j], key[j] = _score_and_key(logit, expert_bias[j])
 
-        best_key = Uint32(key[0])
-        best_local_idx = Int32(0)
-        for j in cutlass.range_constexpr(1, experts_per_thread):
-            if Uint32(key[j]) > best_key:
-                best_key = Uint32(key[j])
-                best_local_idx = Int32(j)
+        best_key, best_local_idx = self._find_best_local(key)
 
         out_key = Uint32(0)
         out_id = Int32(-1)
         out_score = Float32(0.0)
         for slot in cutlass.range_constexpr(_TOPK):
-            top = Uint32(cute.arch.warp_redux_sync(best_key, "umax"))
+            top = cute.arch.warp_redux_sync(best_key, "umax")
             tied_expert_id = Uint32(0xFFFFFFFF)
             if best_key == top:
                 tied_expert_id = Uint32(warp_base + lane + 32 * best_local_idx)
@@ -550,12 +544,7 @@ class FullTopkKernel:
                     if best_local_idx == j:
                         won = score[j]
                         key[j] = Uint32(0)
-                best_key = Uint32(key[0])
-                best_local_idx = Int32(0)
-                for j in cutlass.range_constexpr(1, experts_per_thread):
-                    if Uint32(key[j]) > best_key:
-                        best_key = Uint32(key[j])
-                        best_local_idx = Int32(j)
+                best_key, best_local_idx = self._find_best_local(key)
             weight = cute.arch.shuffle_sync(won, (winner - warp_base) & 31)
             if lane == slot:
                 out_key = top
@@ -585,15 +574,13 @@ class FullTopkKernel:
             slot_weight = Float32(0.0)
             slot_id = Int32(0)
             for slot in cutlass.range_constexpr(_TOPK):
-                top = Uint32(cute.arch.warp_redux_sync(cand_key, "umax"))
+                top = cute.arch.warp_redux_sync(cand_key, "umax")
                 tied_expert_id = Uint32(0xFFFFFFFF)
                 if cand_key == top:
                     tied_expert_id = Uint32(cand_id)
                 chosen = Int32(cute.arch.warp_redux_sync(tied_expert_id, "umin"))
-                holders = Uint32(cute.arch.vote_ballot_sync(cand_id == chosen))
-                first = Int32(
-                    cute.arch.popc((holders & (Uint32(0) - holders)) - Uint32(1))
-                )
+                holders = cute.arch.vote_ballot_sync(cand_id == chosen)
+                first = cute.arch.popc((holders & (Uint32(0) - holders)) - 1)
                 weight = cute.arch.shuffle_sync(cand_score, first)
                 if cand_id == chosen:
                     cand_key = Uint32(0)
