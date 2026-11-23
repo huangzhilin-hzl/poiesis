@@ -1,0 +1,56 @@
+experiments/ops/cutedsl/dsv4_topk_profile.py
+  h_65d95dfcbf63bf 1-1177
+notes/dsv4_topk_ptx_ncu_analysis.md
+  h_65d95dfcbf63bf 1-162
+profile/ncu/dsv4_topk_sm90_e384_raw.csv
+  h_65d95dfcbf63bf 1-17
+profile/ncu/run_dsv4_topk_ncu.sh
+  h_65d95dfcbf63bf 1-76
+profile/ptx/dsv4_topk/cutedsl_sm90_dsv4_topk_1w_e384.ptx
+  h_65d95dfcbf63bf 1-1342
+profile/ptx/dsv4_topk/cutedsl_sm90_dsv4_topk_4w_e384.ptx
+  h_65d95dfcbf63bf 1-636
+profile/ptx/dsv4_topk/triton_sm90_dsv4_topk_e384.ptx
+  h_65d95dfcbf63bf 1-2553
+profile/sass/dsv4_topk/cutedsl_sm90_dsv4_topk_1w_e384_cuobjdump.sass
+  h_65d95dfcbf63bf 1-2073
+profile/sass/dsv4_topk/cutedsl_sm90_dsv4_topk_1w_e384_m16.txt
+  h_65d95dfcbf63bf 1-4977
+profile/sass/dsv4_topk/cutedsl_sm90_dsv4_topk_1w_e384_m16_sass.txt
+  h_65d95dfcbf63bf 1-1045
+profile/sass/dsv4_topk/cutedsl_sm90_dsv4_topk_1w_e384_m4096.txt
+  h_65d95dfcbf63bf 1-4992
+profile/sass/dsv4_topk/cutedsl_sm90_dsv4_topk_1w_e384_m4096_sass.txt
+  h_65d95dfcbf63bf 1-1045
+profile/sass/dsv4_topk/cutedsl_sm90_dsv4_topk_4w_e384_cuobjdump.sass
+  h_65d95dfcbf63bf 1-1049
+profile/sass/dsv4_topk/cutedsl_sm90_dsv4_topk_4w_e384_m16.txt
+  h_65d95dfcbf63bf 1-5050
+profile/sass/dsv4_topk/cutedsl_sm90_dsv4_topk_4w_e384_m16_sass.txt
+  h_65d95dfcbf63bf 1-533
+profile/sass/dsv4_topk/cutedsl_sm90_dsv4_topk_4w_e384_m4096.txt
+  h_65d95dfcbf63bf 1-5059
+profile/sass/dsv4_topk/cutedsl_sm90_dsv4_topk_4w_e384_m4096_sass.txt
+  h_65d95dfcbf63bf 1-533
+profile/sass/dsv4_topk/triton_sm90_dsv4_topk_e384_cuobjdump.sass
+  h_65d95dfcbf63bf 1-3337
+profile/sass/dsv4_topk/triton_sm90_dsv4_topk_e384_m16.txt
+  h_65d95dfcbf63bf 1-4967
+profile/sass/dsv4_topk/triton_sm90_dsv4_topk_e384_m16_sass.txt
+  h_65d95dfcbf63bf 1-1675
+profile/sass/dsv4_topk/triton_sm90_dsv4_topk_e384_m4096.txt
+  h_65d95dfcbf63bf 1-4973
+profile/sass/dsv4_topk/triton_sm90_dsv4_topk_e384_m4096_sass.txt
+  h_65d95dfcbf63bf 1-1675
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ef997d4018c73383071767cb1a750abf699e8a76",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}
