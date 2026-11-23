@@ -1,0 +1,18 @@
+notes/deepseek_v41_flash/README.md
+  h_65d95dfcbf63bf 1-64
+notes/deepseek_v41_flash/deepseek_v41_flash_architecture.svg
+  h_65d95dfcbf63bf 1-1060
+notes/deepseek_v41_flash/generate_architecture_diagram.py
+  h_65d95dfcbf63bf 1-1937
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0fd135096c13fae3024cafcfc170a9de774b70f7",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}
