@@ -117,7 +117,7 @@ def parse_sass_stats(path: str) -> tuple[int, Counter[str]]:
             continue
         base = m.group(1).split(".")[0]
         total += 1
-        if base == "REDUX":
+        if base in ("REDUX", "CREDUX"):
             counts["REDUX"] += 1
         elif base == "SHFL":
             counts["SHFL"] += 1
@@ -137,7 +137,7 @@ def parse_sass_stats(path: str) -> tuple[int, Counter[str]]:
             counts["LDL/STL"] += 1
         elif base == "MUFU":
             counts["MUFU"] += 1
-        elif base in ("FADD", "FMUL", "FFMA", "FMNMX"):
+        elif base in ("FADD", "FADD2", "FMUL", "FFMA", "FMNMX", "FMNMX3"):
             counts["FP32"] += 1
         elif base in ("FSETP", "ISETP", "SEL", "FSEL"):
             counts["CMP/SEL"] += 1
@@ -845,7 +845,8 @@ def _mode_dump_single(num_experts: int, variant: str, out_dir: str) -> None:
     import torch
 
     compile_cutedsl, run_triton, run_cutedsl = _build_gpu_kernels()
-    major, _ = torch.cuda.get_device_capability()
+    major, minor = torch.cuda.get_device_capability()
+    sm_tag = f"sm{major}{minor}"
     use_pdl = major >= 9
     os.makedirs(out_dir, exist_ok=True)
 
@@ -859,12 +860,14 @@ def _mode_dump_single(num_experts: int, variant: str, out_dir: str) -> None:
     torch.cuda.synchronize()
 
     if variant == "triton":
-        ptx_path = os.path.join(out_dir, f"triton_sm90_dsv4_topk_e{num_experts}.ptx")
+        ptx_path = os.path.join(
+            out_dir, f"triton_{sm_tag}_dsv4_topk_e{num_experts}.ptx"
+        )
         cubin_path = os.path.join(
-            out_dir, f"triton_sm90_dsv4_topk_e{num_experts}.cubin"
+            out_dir, f"triton_{sm_tag}_dsv4_topk_e{num_experts}.cubin"
         )
         sass_path = os.path.join(
-            out_dir, f"triton_sm90_dsv4_topk_e{num_experts}_cuobjdump.sass"
+            out_dir, f"triton_{sm_tag}_dsv4_topk_e{num_experts}_cuobjdump.sass"
         )
         with open(ptx_path, "w") as f:
             f.write(compiled_tri.asm["ptx"])
@@ -878,7 +881,7 @@ def _mode_dump_single(num_experts: int, variant: str, out_dir: str) -> None:
         res = subprocess.check_output(
             ["cuobjdump", "--dump-resource-usage", cubin_path], text=True
         )
-        print(f"=== triton E={num_experts} ===\n{res.strip()}")
+        print(f"=== triton ({sm_tag}) E={num_experts} ===\n{res.strip()}")
         return
 
     num_warps = 1 if variant == "cutedsl_1w" else 4
@@ -894,14 +897,14 @@ def _mode_dump_single(num_experts: int, variant: str, out_dir: str) -> None:
     ptxs = sorted(glob.glob(os.path.join(out_dir, "*.ptx")))
     if ptxs:
         dst_ptx = os.path.join(
-            out_dir, f"cutedsl_sm90_dsv4_topk_{num_warps}w_e{num_experts}.ptx"
+            out_dir, f"cutedsl_{sm_tag}_dsv4_topk_{num_warps}w_e{num_experts}.ptx"
         )
         if ptxs[0] != dst_ptx:
             os.replace(ptxs[0], dst_ptx)
     if cubins:
         sass_path = os.path.join(
             out_dir,
-            f"cutedsl_sm90_dsv4_topk_{num_warps}w_e{num_experts}_cuobjdump.sass",
+            f"cutedsl_{sm_tag}_dsv4_topk_{num_warps}w_e{num_experts}_cuobjdump.sass",
         )
         sass = subprocess.check_output(
             ["cuobjdump", "--dump-sass", cubins[0]], text=True
@@ -911,10 +914,17 @@ def _mode_dump_single(num_experts: int, variant: str, out_dir: str) -> None:
         res = subprocess.check_output(
             ["cuobjdump", "--dump-resource-usage", cubins[0]], text=True
         )
-        print(f"=== {variant} E={num_experts} (bit-exact OK) ===\n{res.strip()}")
+        print(
+            f"=== {variant} ({sm_tag}) E={num_experts} (bit-exact OK) ===\n"
+            f"{res.strip()}"
+        )
 
 
 def _mode_dump(num_experts: int, out_dir: str) -> None:
+    import torch
+
+    major, minor = torch.cuda.get_device_capability()
+    sm_tag = f"sm{major}{minor}"
     os.makedirs(out_dir, exist_ok=True)
     # Invoke isolated subprocesses so CUTE_DSL_DUMP_DIR cleanly separates 1W vs 4W.
     sub_dirs = {
@@ -949,31 +959,33 @@ def _mode_dump(num_experts: int, out_dir: str) -> None:
         (
             f"Triton_E{num_experts}",
             os.path.join(
-                sub_dirs["triton"], f"triton_sm90_dsv4_topk_e{num_experts}.ptx"
+                sub_dirs["triton"], f"triton_{sm_tag}_dsv4_topk_e{num_experts}.ptx"
             ),
             os.path.join(
                 sub_dirs["triton"],
-                f"triton_sm90_dsv4_topk_e{num_experts}_cuobjdump.sass",
+                f"triton_{sm_tag}_dsv4_topk_e{num_experts}_cuobjdump.sass",
             ),
         ),
         (
             f"CuTe_1W_E{num_experts}",
             os.path.join(
-                sub_dirs["cutedsl_1w"], f"cutedsl_sm90_dsv4_topk_1w_e{num_experts}.ptx"
+                sub_dirs["cutedsl_1w"],
+                f"cutedsl_{sm_tag}_dsv4_topk_1w_e{num_experts}.ptx",
             ),
             os.path.join(
                 sub_dirs["cutedsl_1w"],
-                f"cutedsl_sm90_dsv4_topk_1w_e{num_experts}_cuobjdump.sass",
+                f"cutedsl_{sm_tag}_dsv4_topk_1w_e{num_experts}_cuobjdump.sass",
             ),
         ),
         (
             f"CuTe_4W_E{num_experts}",
             os.path.join(
-                sub_dirs["cutedsl_4w"], f"cutedsl_sm90_dsv4_topk_4w_e{num_experts}.ptx"
+                sub_dirs["cutedsl_4w"],
+                f"cutedsl_{sm_tag}_dsv4_topk_4w_e{num_experts}.ptx",
             ),
             os.path.join(
                 sub_dirs["cutedsl_4w"],
-                f"cutedsl_sm90_dsv4_topk_4w_e{num_experts}_cuobjdump.sass",
+                f"cutedsl_{sm_tag}_dsv4_topk_4w_e{num_experts}_cuobjdump.sass",
             ),
         ),
     ]

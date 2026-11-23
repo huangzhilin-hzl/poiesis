@@ -14,13 +14,16 @@ VENV_DIR="${VIRTUAL_ENV:-$PROJECT_ROOT/.venv}"
 PYTHON_BIN="${PYTHON_BIN:-$VENV_DIR/bin/python}"
 NUM_EXPERTS="${NUM_EXPERTS:-384}"
 MS_NCU="${MS_NCU:-1,16,256,1024,4096}"
-MS_BENCH="${MS_BENCH:-1,16,256,312,512,1024,4096}"
-OUT_ROOT="${OUT_ROOT:-/tmp/poiesis/dsv4_topk_e${NUM_EXPERTS}}"
+MS_BENCH="${MS_BENCH:-1,16,256,312,512,640,1024,4096}"
+SM_TAG="${SM_TAG:-$("$PYTHON_BIN" -c 'import torch; m, n = torch.cuda.get_device_capability(); print(f"sm{m}{n}")')}"
+L2_FLUSH_MB="${L2_FLUSH_MB:-$("$PYTHON_BIN" -c 'import torch; p = torch.cuda.get_device_properties(0); print(max(160, int(p.L2_cache_size * 2.5 // (1024 * 1024))))')}"
+OUT_ROOT="${OUT_ROOT:-/tmp/poiesis/dsv4_topk_${SM_TAG}_e${NUM_EXPERTS}}"
 
 TARGET_SCRIPT="$PROJECT_ROOT/experiments/ops/cutedsl/dsv4_topk_profile.py"
 
 mkdir -p "$OUT_ROOT/ptx_sass" "$OUT_ROOT/ncu" "$OUT_ROOT/export"
 
+echo "=== Target arch: ${SM_TAG}, E=${NUM_EXPERTS}, L2_FLUSH_MB=${L2_FLUSH_MB} ==="
 echo "=== 1. Dump PTX, CUBIN, SASS & static instruction breakdown ==="
 "$PYTHON_BIN" "$TARGET_SCRIPT" \
   --mode dump \
@@ -28,7 +31,7 @@ echo "=== 1. Dump PTX, CUBIN, SASS & static instruction breakdown ==="
   --out-dir "$OUT_ROOT/ptx_sass"
 
 echo "=== 2. Capture Nsight Compute full metrics (Cold-L2, base clock) ==="
-REP="$OUT_ROOT/ncu/dsv4_topk_sm90_e${NUM_EXPERTS}"
+REP="$OUT_ROOT/ncu/dsv4_topk_${SM_TAG}_e${NUM_EXPERTS}"
 ncu \
   --profile-from-start off \
   --set full \
@@ -42,7 +45,7 @@ ncu \
   --ms "$MS_NCU"
 
 echo "=== 3. Export NCU raw CSV, details, and annotated SASS ==="
-RAW_CSV="$OUT_ROOT/ncu/dsv4_topk_sm90_e${NUM_EXPERTS}_raw.csv"
+RAW_CSV="$OUT_ROOT/ncu/dsv4_topk_${SM_TAG}_e${NUM_EXPERTS}_raw.csv"
 ncu --import "${REP}.ncu-rep" --page raw --csv > "$RAW_CSV"
 
 # Default launch order for MS_NCU=1,16,256,1024,4096 (3 kernels per M):
@@ -58,12 +61,12 @@ export_launch() {
 }
 
 if [[ "$MS_NCU" == "1,16,256,1024,4096" ]]; then
-  export_launch 3  "triton_sm90_dsv4_topk_e${NUM_EXPERTS}_m16"
-  export_launch 4  "cutedsl_sm90_dsv4_topk_1w_e${NUM_EXPERTS}_m16"
-  export_launch 5  "cutedsl_sm90_dsv4_topk_4w_e${NUM_EXPERTS}_m16"
-  export_launch 12 "triton_sm90_dsv4_topk_e${NUM_EXPERTS}_m4096"
-  export_launch 13 "cutedsl_sm90_dsv4_topk_1w_e${NUM_EXPERTS}_m4096"
-  export_launch 14 "cutedsl_sm90_dsv4_topk_4w_e${NUM_EXPERTS}_m4096"
+  export_launch 3  "triton_${SM_TAG}_dsv4_topk_e${NUM_EXPERTS}_m16"
+  export_launch 4  "cutedsl_${SM_TAG}_dsv4_topk_1w_e${NUM_EXPERTS}_m16"
+  export_launch 5  "cutedsl_${SM_TAG}_dsv4_topk_4w_e${NUM_EXPERTS}_m16"
+  export_launch 12 "triton_${SM_TAG}_dsv4_topk_e${NUM_EXPERTS}_m4096"
+  export_launch 13 "cutedsl_${SM_TAG}_dsv4_topk_1w_e${NUM_EXPERTS}_m4096"
+  export_launch 14 "cutedsl_${SM_TAG}_dsv4_topk_4w_e${NUM_EXPERTS}_m4096"
 fi
 
 echo "=== 4. Parse NCU CSV summary tables ==="
@@ -73,4 +76,5 @@ echo "=== 5. Pure-GPU Cold-L2 CUDA-Graph latency benchmark ==="
 "$PYTHON_BIN" "$TARGET_SCRIPT" \
   --mode bench \
   --num-experts "$NUM_EXPERTS" \
-  --ms "$MS_BENCH"
+  --ms "$MS_BENCH" \
+  --l2-flush-mb "$L2_FLUSH_MB"
