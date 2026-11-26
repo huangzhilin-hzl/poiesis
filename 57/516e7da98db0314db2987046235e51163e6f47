@@ -1,0 +1,100 @@
+experiments/ops/cutedsl/mxfp8_gemv_profile.py
+  h_65d95dfcbf63bf 1-1671
+notes/mxfp8_gemv_ptx_ncu_analysis.md
+  h_65d95dfcbf63bf 1-118
+profile/ncu/mxfp8_gemv_sm90_raw.csv
+  h_65d95dfcbf63bf 1-16
+profile/ncu/run_mxfp8_gemv_ncu.sh
+  h_65d95dfcbf63bf 1-78
+profile/ptx/mxfp8_gemv/ampere_sm90_q_b_idx_8192x1280_m24.ptx
+  h_65d95dfcbf63bf 1-1445
+profile/ptx/mxfp8_gemv/ampere_sm90_qkv_a_1792x5120_m24.ptx
+  h_65d95dfcbf63bf 1-2139
+profile/ptx/mxfp8_gemv/ampere_sm90_shared_w2_5120x288_m24.ptx
+  h_65d95dfcbf63bf 1-1242
+profile/ptx/mxfp8_gemv/ampere_sm90_wo_b_5120x1024_m24.ptx
+  h_65d95dfcbf63bf 1-1998
+profile/ptx/mxfp8_gemv/ampere_sm90_wo_b_5120x1024_m48.ptx
+  h_65d95dfcbf63bf 1-991
+profile/ptx/mxfp8_gemv/hopper_sm90_q_b_idx_8192x1280_m24.ptx
+  h_65d95dfcbf63bf 1-1378
+profile/ptx/mxfp8_gemv/hopper_sm90_qkv_a_1792x5120_m24.ptx
+  h_65d95dfcbf63bf 1-1623
+profile/ptx/mxfp8_gemv/hopper_sm90_shared_w2_5120x288_m24.ptx
+  h_65d95dfcbf63bf 1-505
+profile/ptx/mxfp8_gemv/hopper_sm90_wo_b_5120x1024_m24.ptx
+  h_65d95dfcbf63bf 1-2004
+profile/ptx/mxfp8_gemv/hopper_sm90_wo_b_5120x1024_m48.ptx
+  h_65d95dfcbf63bf 1-2767
+profile/sass/mxfp8_gemv/ampere_sm90_q_b_idx_8192x1280_m24.txt
+  h_65d95dfcbf63bf 1-5069
+profile/sass/mxfp8_gemv/ampere_sm90_q_b_idx_8192x1280_m24_cuobjdump.sass
+  h_65d95dfcbf63bf 1-1769
+profile/sass/mxfp8_gemv/ampere_sm90_q_b_idx_8192x1280_m24_sass.txt
+  h_65d95dfcbf63bf 1-893
+profile/sass/mxfp8_gemv/ampere_sm90_qkv_a_1792x5120_m24.txt
+  h_65d95dfcbf63bf 1-5062
+profile/sass/mxfp8_gemv/ampere_sm90_qkv_a_1792x5120_m24_cuobjdump.sass
+  h_65d95dfcbf63bf 1-2393
+profile/sass/mxfp8_gemv/ampere_sm90_qkv_a_1792x5120_m24_sass.txt
+  h_65d95dfcbf63bf 1-1205
+profile/sass/mxfp8_gemv/ampere_sm90_shared_w2_5120x288_m24.txt
+  h_65d95dfcbf63bf 1-5060
+profile/sass/mxfp8_gemv/ampere_sm90_shared_w2_5120x288_m24_cuobjdump.sass
+  h_65d95dfcbf63bf 1-1497
+profile/sass/mxfp8_gemv/ampere_sm90_shared_w2_5120x288_m24_sass.txt
+  h_65d95dfcbf63bf 1-757
+profile/sass/mxfp8_gemv/ampere_sm90_wo_b_5120x1024_m24.txt
+  h_65d95dfcbf63bf 1-5049
+profile/sass/mxfp8_gemv/ampere_sm90_wo_b_5120x1024_m24_cuobjdump.sass
+  h_65d95dfcbf63bf 1-2153
+profile/sass/mxfp8_gemv/ampere_sm90_wo_b_5120x1024_m24_sass.txt
+  h_65d95dfcbf63bf 1-1085
+profile/sass/mxfp8_gemv/ampere_sm90_wo_b_5120x1024_m48.txt
+  h_65d95dfcbf63bf 1-5062
+profile/sass/mxfp8_gemv/ampere_sm90_wo_b_5120x1024_m48_cuobjdump.sass
+  h_65d95dfcbf63bf 1-1289
+profile/sass/mxfp8_gemv/ampere_sm90_wo_b_5120x1024_m48_sass.txt
+  h_65d95dfcbf63bf 1-653
+profile/sass/mxfp8_gemv/hopper_sm90_q_b_idx_8192x1280_m24.txt
+  h_65d95dfcbf63bf 1-5060
+profile/sass/mxfp8_gemv/hopper_sm90_q_b_idx_8192x1280_m24_cuobjdump.sass
+  h_65d95dfcbf63bf 1-1673
+profile/sass/mxfp8_gemv/hopper_sm90_q_b_idx_8192x1280_m24_sass.txt
+  h_65d95dfcbf63bf 1-845
+profile/sass/mxfp8_gemv/hopper_sm90_qkv_a_1792x5120_m24.txt
+  h_65d95dfcbf63bf 1-5056
+profile/sass/mxfp8_gemv/hopper_sm90_qkv_a_1792x5120_m24_cuobjdump.sass
+  h_65d95dfcbf63bf 1-2169
+profile/sass/mxfp8_gemv/hopper_sm90_qkv_a_1792x5120_m24_sass.txt
+  h_65d95dfcbf63bf 1-1093
+profile/sass/mxfp8_gemv/hopper_sm90_shared_w2_5120x288_m24.txt
+  h_65d95dfcbf63bf 1-5057
+profile/sass/mxfp8_gemv/hopper_sm90_shared_w2_5120x288_m24_cuobjdump.sass
+  h_65d95dfcbf63bf 1-681
+profile/sass/mxfp8_gemv/hopper_sm90_shared_w2_5120x288_m24_sass.txt
+  h_65d95dfcbf63bf 1-349
+profile/sass/mxfp8_gemv/hopper_sm90_wo_b_5120x1024_m24.txt
+  h_65d95dfcbf63bf 1-5073
+profile/sass/mxfp8_gemv/hopper_sm90_wo_b_5120x1024_m24_cuobjdump.sass
+  h_65d95dfcbf63bf 1-2265
+profile/sass/mxfp8_gemv/hopper_sm90_wo_b_5120x1024_m24_sass.txt
+  h_65d95dfcbf63bf 1-1141
+profile/sass/mxfp8_gemv/hopper_sm90_wo_b_5120x1024_m48.txt
+  h_65d95dfcbf63bf 1-5072
+profile/sass/mxfp8_gemv/hopper_sm90_wo_b_5120x1024_m48_cuobjdump.sass
+  h_65d95dfcbf63bf 1-3081
+profile/sass/mxfp8_gemv/hopper_sm90_wo_b_5120x1024_m48_sass.txt
+  h_65d95dfcbf63bf 1-1549
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "57516e7da98db0314db2987046235e51163e6f47",
+  "prompts": {},
+  "humans": {
+    "h_65d95dfcbf63bf": {
+      "author": "墨楼 <huangzhilin.hzl@antgroup.com>"
+    }
+  }
+}
